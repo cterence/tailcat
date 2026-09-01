@@ -1,7 +1,7 @@
 // Copyright (c) Tailscale Inc & contributors
 // SPDX-License-Identifier: BSD-3-Clause
 
-//go:build (linux || darwin) && !ts_omit_ssh
+//go:build (linux || darwin) && !android && !ts_omit_ssh
 
 package tailcat
 

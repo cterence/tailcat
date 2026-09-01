@@ -32,6 +32,7 @@ import (
 
 	"github.com/peterbourgon/ff/v4"
 	"github.com/peterbourgon/ff/v4/ffhelp"
+	qrcode "github.com/skip2/go-qrcode"
 	"github.com/tailscale/tailcat"
 	"github.com/tailscale/tailcat/internal/localhostdns"
 	"go4.org/mem"
@@ -60,6 +61,7 @@ var (
 	flagVerbose           *bool
 	flagFullAddress       *bool
 	flagJSON              *bool
+	flagQR                *bool
 	flagDERPMapURL        *string
 )
 
@@ -96,6 +98,7 @@ func newRootCommand() *ff.Command {
 	flagKey = rootFS.StringLong("key", "", "'new' for an ephemeral key. If empty, the default saved key is used if it exists ('default' in server mode, 'client-default' in client modes; see genkey), else an ephemeral key. Otherwise the path to a *.private.json or a name like 'foo' to read it from $CONFIG/tailcat/keys/foo.private.json")
 	flagVerbose = rootFS.BoolLong("verbose", "be verbose")
 	flagJSON = rootFS.BoolLong("json", "in server mode, write {\"listenAddr\": ...} JSON to stdout")
+	flagQR = rootFS.BoolLong("qr", "in server mode, print the connection address as a QR code to stderr")
 	flagDERPMapURL = rootFS.StringLong("derpmap-url", cmp.Or(os.Getenv("TAILCAT_DERPMAP_URL"), tailcat.DefaultDERPMapURL), "URL of the JSON DERP map used to resolve or auto-select a DERP region; its default can also be set with the TAILCAT_DERPMAP_URL environment variable")
 
 	serveFS = ff.NewFlagSet("serve").SetParent(rootFS)
@@ -1583,6 +1586,14 @@ func server(logf logger.Logf, serveSpec string, execArgs []string) {
 	}
 	if *flagJSON {
 		json.NewEncoder(os.Stdout).Encode(map[string]string{"listenAddr": string(connStr)})
+	}
+	if *flagQR {
+		qr, err := qrcode.New(string(connStr), qrcode.Medium)
+		if err != nil {
+			log.Printf("QR code: %v", err)
+		} else {
+			fmt.Fprintf(os.Stderr, "%s\n", qr.ToSmallString(false))
+		}
 	}
 	if v := os.Getenv("TAILCAT_ADDR_FILE"); v != "" {
 		if tcpAddr, ok := strings.CutPrefix(v, "tcp:"); ok {

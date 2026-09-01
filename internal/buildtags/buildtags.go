@@ -56,10 +56,32 @@ var releaseKeep = []featuretags.FeatureTag{
 	"androidbin",
 }
 
+// androidKeep is the set of tailscale.com feature tags the Android
+// build needs linked. Android runs as GOOS=android, so the SSH
+// server is now supported via tailcat_ssh_android.go (SFTP only, no
+// shell/exec). netstack provides userspace TCP (Android has no kernel
+// TUN access) and bakedroots embeds LetsEncrypt roots as a TLS
+// fallback for DERP relay connections. SSH brings in the c2n and
+// dbus dependencies via featuretags.Requires.
+var androidKeep = []featuretags.FeatureTag{
+	"netstack",
+	"ssh",
+	"bakedroots",
+}
+
 // WasmTags returns the comma-joined -tags value for the wasm build,
 // sorted so the same source tree always produces the same wasm bytes.
 func WasmTags() string {
 	return tags(wasmKeep)
+}
+
+// AndroidTags returns the comma-joined -tags value for the Android
+// (gomobile) build. Like the other tag lists it is purely ts_omit_
+// feature tags: netgo and osusergo are no longer used in any tailcat
+// build (see the package comment), so unlike earlier versions of
+// this function there are no base tags to exclude.
+func AndroidTags() string {
+	return tags(androidKeep)
 }
 
 // ReleaseTags returns the comma-joined -tags value for native builds

@@ -57,4 +57,22 @@ func TestTags(t *testing.T) {
 	if wasm["ts_omit_netstack"] {
 		t.Errorf("WasmTags contains ts_omit_netstack; netstack must stay linked in wasm builds")
 	}
+
+	android := tagSet(t, AndroidTags())
+	for _, want := range []string{"ts_omit_gro"} {
+		if !android[want] {
+			t.Errorf("AndroidTags missing %q", want)
+		}
+	}
+	for _, notWant := range []string{"netgo", "osusergo", "ts_omit_ssh"} {
+		if android[notWant] {
+			t.Errorf("AndroidTags contains %q; must be omitted on Android", notWant)
+		}
+	}
+	if android["ts_omit_netstack"] {
+		t.Errorf("AndroidTags contains ts_omit_netstack; netstack must stay linked in Android builds")
+	}
+	if android["ts_omit_bakedroots"] {
+		t.Errorf("AndroidTags contains ts_omit_bakedroots; bakedroots must stay linked in Android builds")
+	}
 }
