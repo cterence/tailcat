@@ -10,14 +10,6 @@
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
-        # The Android SDK packages are unfree; allow them in this flake.
-        pkgsAllowUnfree = import nixpkgs {
-          inherit system;
-          config = {
-            allowUnfree = true;
-            android_sdk.accept_license = true;
-          };
-        };
         # flakehashes.json is maintained by `make tidy`
         # (tool/updateflakes); do not edit it by hand.
         flakeHashes = builtins.fromJSON (builtins.readFile ./flakehashes.json);
@@ -34,7 +26,23 @@
           };
         });
         buildGoModule = pkgs.buildGoModule.override { inherit go; };
-        androidSdkPkgs = pkgsAllowUnfree.androidenv.composeAndroidPackages {
+        # The Android SDK packages are unfree. We can't use `import nixpkgs {
+        # config.allowUnfree = true; }` because that requires --impure in flake
+        # evaluation. Instead, call compose-android-packages.nix directly with
+        # licenseAccepted=true and a meta attrset that omits the unfree
+        # license, so pure-mode evaluation passes without --impure.
+        androidSdkMeta = {
+          homepage = "https://developer.android.com/tools";
+          description = "Android SDK tools, packaged in Nixpkgs";
+          platforms = pkgs.lib.platforms.all;
+        };
+        androidSdkPkgsRaw = pkgs.callPackage
+          (pkgs.path + "/pkgs/development/mobile/androidenv/compose-android-packages.nix")
+          {
+            licenseAccepted = true;
+            meta = androidSdkMeta;
+          };
+        androidSdkPkgs = androidSdkPkgsRaw {
           platformToolsVersion = "37.0.1";
           buildToolsVersions = [ "34.0.0" "35.0.0" ];
           includeNDK = true;
@@ -69,15 +77,16 @@
         # Android development shell: Go, gomobile, Kotlin, Gradle, JDK, and the
         # Android SDK with NDK for cross-compiling the Go bridge via gomobile
         # and building the APK via Gradle.
-        # The SDK is unfree and requires license acceptance, so enter with:
-        #   NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 nix develop --impure .#android
         devShells.android = pkgs.mkShell {
           packages = [
             go
             pkgs.kotlin
             pkgs.gradle
-            pkgs.gomobile
+            (pkgs.gomobile.override {
+              androidPkgs = androidSdkPkgs;
+            })
             pkgs.jdk17
+            pkgs.android-tools
           ];
           ANDROID_HOME = androidSdkPath;
           ANDROID_SDK_ROOT = androidSdkPath;
@@ -85,6 +94,11 @@
           # Gradle needs to find aapt2 from the Nix SDK rather than
           # downloading its own copy from Maven.
           GRADLE_OPTS = "-Dorg.gradle.project.android.aapt2FromMavenOverride=${androidSdkPath}/build-tools/35.0.0/aapt2";
+          # Use writable Go caches outside the Nix store so gomobile/gradle
+          # can compile Go code without permission errors.
+          GOPATH = "/tmp/tailcat-gopath";
+          GOCACHE = "/tmp/tailcat-gocache";
+          GOMODCACHE = "/tmp/tailcat-gopath/pkg/mod";
         };
       });
 }
