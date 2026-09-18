@@ -11,3 +11,5 @@
 # Go test artifacts.
 *.test
 *.out
+
+.direnv/

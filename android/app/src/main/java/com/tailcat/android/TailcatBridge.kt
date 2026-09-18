@@ -221,6 +221,22 @@ class TailcatSFTPClient(private val sftp: SFTPClient) {
             override fun onProgress(sent: Long, total: Long) {
                 onProgress(sent, total)
             }
+            override fun isCancelled(): Boolean = false
+        })
+    }
+
+    /** Downloads with per-transfer progress and cancel, like the [uploadFile] overload. */
+    fun downloadFile(
+        remotePath: String,
+        localPath: String,
+        onProgress: (sent: Long, total: Long) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Long {
+        return sftp.downloadFileWithProgress(remotePath, localPath, object : ProgressListener {
+            override fun onProgress(sent: Long, total: Long) {
+                onProgress(sent, total)
+            }
+            override fun isCancelled(): Boolean = isCancelled()
         })
     }
 
@@ -234,16 +250,28 @@ class TailcatSFTPClient(private val sftp: SFTPClient) {
             override fun onProgress(sent: Long, total: Long) {
                 onProgress(sent, total)
             }
+            override fun isCancelled(): Boolean = false
         })
     }
 
     /**
-     * Aborts any in-flight upload/download on this client: the
-     * transfer stops at the next progress check (within ~150 ms) and
-     * the call returns with an error.
+     * Uploads with per-file progress and a per-transfer cancel: the
+     * transfer polls [isCancelled] before every chunk and aborts if it
+     * returns true. Per-transfer, so parallel transfers over one
+     * session cancel independently.
      */
-    fun cancel() {
-        sftp.cancel()
+    fun uploadFile(
+        localPath: String,
+        remotePath: String,
+        onProgress: (sent: Long, total: Long) -> Unit,
+        isCancelled: () -> Boolean,
+    ): Long {
+        return sftp.uploadFileWithProgress(localPath, remotePath, object : ProgressListener {
+            override fun onProgress(sent: Long, total: Long) {
+                onProgress(sent, total)
+            }
+            override fun isCancelled(): Boolean = isCancelled()
+        })
     }
 
     fun uploadFileGetPath(localPath: String, remotePath: String): String {

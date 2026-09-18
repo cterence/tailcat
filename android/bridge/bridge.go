@@ -31,7 +31,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/pkg/sftp"
@@ -877,18 +876,9 @@ func (c *Client) Dial(port int) (*Conn, error) {
 
 // SFTPClient wraps an SFTP client session over the tunnel.
 type SFTPClient struct {
-	sc       *sftp.Client
-	conn     net.Conn
-	close    func()
-	cancelled atomic.Bool
-}
-
-// Cancel aborts any in-flight progress-reporting transfer on this
-// client: the transfer aborts at the next progress check (within one
-// progress interval). Safe to call from any goroutine; used by the
-// app's cancel button.
-func (s *SFTPClient) Cancel() {
-	s.cancelled.Store(true)
+	sc    *sftp.Client
+	conn  net.Conn
+	close func()
 }
 
 // DialSFTP connects to port 22 on the server, does the SSH handshake
@@ -1019,7 +1009,7 @@ func (s *SFTPClient) downloadFile(remotePath, localPath string, progress Progres
 			// Report 0 at the start so the UI can show the total and a
 			// 0% bar immediately.
 			progress.OnProgress(0, st.Size())
-			pw = &progressWriter{w: w, total: st.Size(), lastReport: time.Now(), cancel: &s.cancelled, progress: progress}
+			pw = &progressWriter{w: w, total: st.Size(), lastReport: time.Now(), progress: progress}
 			dst = pw
 		}
 		// A Stat failure just means no progress reporting; the download
@@ -1028,7 +1018,15 @@ func (s *SFTPClient) downloadFile(remotePath, localPath string, progress Progres
 
 	n, err := io.Copy(dst, r)
 	if err != nil {
-		return n, fmt.Errorf("copy: %w", err)
+		// The local file was created fresh by this call, and a partial
+		// file is corrupt data — remove it so a cancelled or failed
+		// download leaves nothing misleading behind. Best-effort: the
+		// message says the file remains if removal fails.
+		w.Close()
+		if rmErr := os.Remove(localPath); rmErr != nil {
+			return n, fmt.Errorf("copy: %w (partial file left at %s: %v)", err, localPath, rmErr)
+		}
+		return n, fmt.Errorf("copy: %w (partial file removed)", err)
 	}
 	if progress != nil && pw != nil {
 		progress.OnProgress(n, pw.total)
@@ -1045,12 +1043,11 @@ type progressWriter struct {
 	sent       int64
 	reported   int64
 	lastReport time.Time
-	cancel     *atomic.Bool
 	progress   ProgressListener
 }
 
 func (p *progressWriter) Write(buf []byte) (int, error) {
-	if p.cancel != nil && p.cancel.Load() {
+	if p.progress.IsCancelled() { // per-transfer, safe with parallel transfers
 		return 0, errors.New("transfer cancelled")
 	}
 	n, err := p.w.Write(buf)
@@ -1080,11 +1077,15 @@ func (s *SFTPClient) UploadFileGetPath(localPath, remotePath string) (string, er
 	return actualPath, err
 }
 
-// ProgressListener receives upload progress: the bytes sent so far and
-// the file's total size. Called from a background goroutine during the
-// upload, roughly every 256 KiB and once at the end.
+// ProgressListener receives upload or download progress: the bytes
+// transferred so far and the file's total size. Called from a
+// background goroutine roughly every progressMinInterval. Each
+// transfer polls IsCancelled before every chunk and aborts if it
+// returns true, so several transfers can run in parallel over one
+// SFTP session and be cancelled independently.
 type ProgressListener interface {
 	OnProgress(sent, total int64)
+	IsCancelled() bool
 }
 
 // UploadFileWithProgress is UploadFile with per-file progress
@@ -1103,7 +1104,6 @@ type progressReader struct {
 	sent       int64
 	reported   int64
 	lastReport time.Time
-	cancel     *atomic.Bool
 	progress   ProgressListener
 }
 
@@ -1119,7 +1119,7 @@ const progressInterval = 256 << 10
 var progressMinInterval = 150 * time.Millisecond
 
 func (p *progressReader) Read(buf []byte) (int, error) {
-	if p.cancel != nil && p.cancel.Load() {
+	if p.progress.IsCancelled() { // per-transfer, safe with parallel transfers
 		return 0, errors.New("transfer cancelled")
 	}
 	n, err := p.r.Read(buf)
@@ -1178,7 +1178,7 @@ func (s *SFTPClient) uploadFile(localPath, remotePath string, progress ProgressL
 			// Report 0 at the start so the UI can show the total and
 			// a 0% bar immediately.
 			progress.OnProgress(0, fi.Size())
-			pr = &progressReader{r: r, total: fi.Size(), lastReport: time.Now(), cancel: &s.cancelled, progress: progress}
+			pr = &progressReader{r: r, total: fi.Size(), lastReport: time.Now(), progress: progress}
 			src = pr
 		}
 		// A Stat failure just means no progress reporting; the upload

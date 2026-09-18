@@ -7,7 +7,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -93,7 +95,6 @@ fun SendScreen(
     }
 
     val busy = transfer?.phase == "connecting" || transfer?.phase == "sending"
-    val totalSize = selectedFiles.sumOf { it.size }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
         Text("Send", style = MaterialTheme.typography.headlineMedium)
@@ -135,20 +136,48 @@ fun SendScreen(
                 Text(if (selectedFiles.isNotEmpty()) "Selected ${selectedFiles.size} file(s)" else "Choose files (long press to select multiple)")
             }
 
-            if (selectedFiles.isNotEmpty()) {
+            // While a transfer is in flight (or has a result), the list
+            // renders the transfer's own files — the hoisted state —
+            // so per-file status survives tab switches. Otherwise it
+            // shows the freshly picked selection.
+            val showTransferList = transfer != null && transfer.files.isNotEmpty() &&
+                transfer.phase != null && transfer.phase != "idle"
+            val displayFiles = if (showTransferList) transfer!!.files else selectedFiles
+            // Per-row status: a tick once the transfer moved past the
+            // file, a spinner on the file in flight, nothing pending.
+            val fileDone: (Int) -> Boolean = { i ->
+                transfer != null && (transfer.phase == "done" || i < transfer.index)
+            }
+            val fileSending: (Int) -> Boolean = { i ->
+                transfer != null && transfer.phase == "sending" && i == transfer.index
+            }
+
+            if (displayFiles.isNotEmpty()) {
                 Text(
-                    "Total: ${formatBytes(totalSize)}",
+                    "Total: ${formatBytes(displayFiles.sumOf { it.size })}",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 4.dp),
                 )
                 LazyColumn(modifier = Modifier.weight(1f).padding(top = 8.dp)) {
-                    items(selectedFiles) { file ->
+                    itemsIndexed(displayFiles) { i, file ->
                         Row(
                             modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
                             Text(file.name, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
                             Text(formatBytes(file.size), style = MaterialTheme.typography.bodySmall)
+                            Spacer(Modifier.width(8.dp))
+                            when {
+                                fileDone(i) -> Icon(
+                                    Icons.Default.Check,
+                                    contentDescription = "Sent",
+                                    tint = MaterialTheme.colorScheme.primary,
+                                )
+                                fileSending(i) -> CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                            }
                         }
                         HorizontalDivider()
                     }
@@ -223,14 +252,13 @@ fun SendScreen(
                                                 input.copyTo(out)
                                             }
                                         } ?: throw IllegalStateException("Cannot open ${file.name}")
-                                        sftp.uploadFile(tmpFile.absolutePath, "/${file.name}") { sent, total ->
-                                            // Cooperative cancel: the job is cancelled from
-                                            // the UI; the next progress tick tells the Go
-                                            // side to abort, so even a huge file stops
-                                            // within one progress interval.
-                                            if (!isActive) sftp.cancel()
-                                            onTransferChange { t -> t?.copy(sent = sent, total = total) }
-                                        }
+                                        sftp.uploadFile(
+                                            tmpFile.absolutePath, "/${file.name}",
+                                            onProgress = { sent, total ->
+                                                onTransferChange { t -> t?.copy(sent = sent, total = total) }
+                                            },
+                                            isCancelled = { !isActive },
+                                        )
                                         tmpFile?.delete()
                                         tmpFile = null
                                     }

@@ -578,10 +578,31 @@ func TestServerRestartKeepsAddressAndServes(t *testing.T) {
 	}
 }
 
-// funcProgress adapts a function to ProgressListener.
+// funcProgress adapts a function to ProgressListener (never cancelled).
 type funcProgress func(sent, total int64)
 
 func (f funcProgress) OnProgress(sent, total int64) { f(sent, total) }
+
+func (f funcProgress) IsCancelled() bool { return false }
+
+// autoCancel cancels the transfer after its first progress report,
+// deterministically aborting mid-transfer.
+type autoCancel struct {
+	mu    sync.Mutex
+	fired bool
+}
+
+func (a *autoCancel) OnProgress(sent, total int64) {
+	a.mu.Lock()
+	a.fired = true
+	a.mu.Unlock()
+}
+
+func (a *autoCancel) IsCancelled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.fired
+}
 
 // TestProgressWriter checks the download-progress callback cadence:
 // reports every progressInterval bytes. io.Copy feeds the writer in
@@ -711,16 +732,50 @@ func TestSFTPUploadPartNaming(t *testing.T) {
 		t.Errorf("numbered variant missing: %v", err)
 	}
 
-	// A cancelled upload leaves nothing behind.
-	sc.Cancel()
-	if _, err := sc.UploadFileWithProgress(local, "/cancel.txt", funcProgress(func(int64, int64) {})); err == nil {
-		t.Error("upload after Cancel unexpectedly succeeded")
+	// A cancelled upload leaves nothing behind (per-transfer cancel
+	// via the listener; the session stays usable for other transfers).
+	if _, err := sc.UploadFileWithProgress(local, "/cancel.txt", &autoCancel{}); err == nil {
+		t.Error("cancelled upload unexpectedly succeeded")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "cancel.txt")); err == nil {
 		t.Error("cancelled upload left a final-named file")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "cancel.txt.part")); err == nil {
 		t.Error("cancelled upload left a .part file")
+	}
+
+	// A cancelled download leaves no partial local file, and the
+	// session still works afterwards.
+	out := filepath.Join(t.TempDir(), "hello-out.txt")
+	if _, err := sc.DownloadFileWithProgress("/hello.txt", out, &autoCancel{}); err == nil {
+		t.Error("cancelled download unexpectedly succeeded")
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("cancelled download left a partial file")
+	}
+	if _, err := sc.DownloadFile("/hello.txt", out); err != nil {
+		t.Errorf("download after cancelled download failed: %v", err)
+	}
+	if got, err := os.ReadFile(out); err != nil || !bytes.Equal(got, data) {
+		t.Errorf("plain download after cancel: read %d bytes, err %v", len(got), err)
+	}
+
+	// Two downloads in parallel over the one session both complete.
+	out2 := filepath.Join(t.TempDir(), "hello-out2.txt")
+	var wg sync.WaitGroup
+	wg.Add(2)
+	var err1, err2 error
+	go func() {
+		defer wg.Done()
+		_, err1 = sc.DownloadFileWithProgress("/hello.txt", out, funcProgress(func(int64, int64) {}))
+	}()
+	go func() {
+		defer wg.Done()
+		_, err2 = sc.DownloadFileWithProgress("/hello.txt", out2, funcProgress(func(int64, int64) {}))
+	}()
+	wg.Wait()
+	if err1 != nil || err2 != nil {
+		t.Errorf("parallel downloads: %v, %v", err1, err2)
 	}
 }
 

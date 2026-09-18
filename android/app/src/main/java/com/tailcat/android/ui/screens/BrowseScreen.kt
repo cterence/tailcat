@@ -13,7 +13,10 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.tailcat.android.TailcatClient
 import com.tailcat.android.TailcatSFTPClient
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -45,16 +48,31 @@ fun BrowseScreen(
         }
     }
 
-    // Reset connection when address changes
+    // Reset the connection when the address changes, and connect up
+    // front when the tab is opened: downloads then start instantly
+    // and, crucially, parallel downloads never race to create the
+    // session.
     LaunchedEffect(address) {
-        if (browseClient != null) {
+        withContext(Dispatchers.IO) {
             browseSftp?.close()
             browseClient?.close()
-            browseSftp = null
-            browseClient = null
-            sftpFiles = emptyList()
-            sftpPath = "/"
-            filterQuery = ""
+        }
+        browseSftp = null
+        browseClient = null
+        sftpFiles = emptyList()
+        sftpPath = "/"
+        filterQuery = ""
+        downloadedRemoteName = null
+        if (address.isEmpty()) return@LaunchedEffect
+        try {
+            withContext(Dispatchers.IO) {
+                val client = TailcatClient(address, "")
+                client.ping()
+                browseClient = client
+                browseSftp = client.dialSFTP()
+            }
+        } catch (e: Exception) {
+            sftpError = e.message
         }
     }
 
@@ -182,6 +200,8 @@ fun BrowseScreen(
                     val downloading = remember { mutableStateOf(false) }
                     // Download progress: bytes written so far (of total).
                     var downloadProgress by remember { mutableStateOf(0L to 0L) }
+                    // The running download's job, for the cancel button.
+                    val downloadJob = remember { mutableStateOf<Job?>(null) }
                     Column {
                     Row(
                         modifier = Modifier
@@ -213,7 +233,9 @@ fun BrowseScreen(
                             Text(formatSize(file.size), style = MaterialTheme.typography.bodySmall)
                             Spacer(Modifier.width(8.dp))
                             if (downloading.value) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                TextButton(onClick = { downloadJob.value?.cancel() }) {
+                                    Text("Cancel")
+                                }
                             } else if (downloadedRemoteName == file.name) {
                                 TextButton(onClick = {
                                     val mime = getMimeType(file.name)
@@ -263,7 +285,7 @@ fun BrowseScreen(
                                     sftpError = null
                                     sftpStatus = null
                                     downloadedRemoteName = null
-                                    scope.launch {
+                                    downloadJob.value = scope.launch {
                                         try {
                                             withContext(Dispatchers.IO) {
                                                 val sftp = browseSftp ?: run {
@@ -283,16 +305,27 @@ fun BrowseScreen(
                                                     localFile = java.io.File(downloads, "$baseName($n)$ext")
                                                     n++
                                                 }
-                                                sftp.downloadFile("$sftpPath/${file.name}", localFile.absolutePath) { sent, total ->
-                                                    downloadProgress = sent to total
-                                                }
+                                                sftp.downloadFile(
+                                                    "$sftpPath/${file.name}", localFile.absolutePath,
+                                                    onProgress = { sent, total ->
+                                                        downloadProgress = sent to total
+                                                    },
+                                                    isCancelled = { !isActive },
+                                                )
                                                 downloadedRemoteName = file.name
                                             }
                                             sftpStatus = "Downloaded ${file.name} to Downloads"
+                                        } catch (e: CancellationException) {
+                                            // User cancelled: the Go side removed the partial.
                                         } catch (e: Exception) {
-                                            sftpError = e.message
+                                            if (!isActive) {
+                                                // Cancel surfaced as an error from the Go side.
+                                            } else {
+                                                sftpError = e.message
+                                            }
+                                        } finally {
+                                            downloading.value = false
                                         }
-                                        downloading.value = false
                                     }
                                 }) {
                                     Text("Download")
