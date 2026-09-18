@@ -1,5 +1,6 @@
 # Build artifacts
 app/libs/tailcat.aar
+app/libs/tailcat-sources.jar
 app/build/
 .gradle/
 build/

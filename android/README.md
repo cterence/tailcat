@@ -35,38 +35,27 @@ android/
 
 ### Prerequisites
 
-Enter the Nix Android dev shell (requires unfree SDK license):
+Enter the Nix Android dev shell:
 
 ```bash
-NIXPKGS_ALLOW_UNFREE=1 NIXPKGS_ACCEPT_ANDROID_SDK_LICENSE=1 nix develop --impure .#android
+nix develop .#android
 ```
 
 This provides: Go 1.27, gomobile, Kotlin, Gradle, JDK 17, Android SDK 35
-with NDK. `ANDROID_HOME`, `ANDROID_SDK_ROOT`, and `ANDROID_NDK_HOME` are
-set automatically. You also need `GOPATH`/`GOCACHE`/`GOMODCACHE` pointing
-at writable directories (the Nix store is read-only):
-
-```bash
-export GOPATH=/tmp/tailcat-gopath
-export GOCACHE=/tmp/tailcat-gocache
-export GOMODCACHE=$GOPATH/pkg/mod
-export PATH="$GOPATH/bin:$PATH"
-```
+with NDK. `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `ANDROID_NDK_HOME`,
+`GOPATH`, `GOCACHE`, and `GOMODCACHE` are all set automatically.
 
 ### One-shot build (AAR + APK)
 
-From the repo root, inside the Nix dev shell:
+From the `android/` directory, inside the Nix dev shell:
 
 ```bash
-# 1. Build the Go AAR
-gomobile bind -tags "$(go run ./internal/buildtags/printtags -android)" \
-  -androidapi 26 -o android/app/libs/tailcat.aar -target=android/arm64 \
-  ./android/bridge
-
-# 2. Build the APK
-cd android
-./gradlew assembleDebug --no-daemon
+make apk
 ```
+
+This runs `gomobile bind` then `./gradlew assembleDebug`. To build just the
+Go AAR: `make aar`. To build just the APK (when the AAR is current):
+`./gradlew assembleDebug --no-daemon`.
 
 The debug APK is at `android/app/build/outputs/apk/debug/app-debug.apk`.
 
@@ -79,11 +68,25 @@ adb pair <device-ip>:<pairing-port> <pairing-code>
 # Connect
 adb connect <device-ip>:<connection-port>
 
-# Install and launch
-adb install -r android/app/build/outputs/apk/debug/app-debug.apk
-adb shell am force-stop com.tailcat.android
-adb shell am start -n com.tailcat.android/.MainActivity
+# Build, install, and launch
+make install
 ```
+
+`make install` auto-selects the device when only one is connected. If
+multiple transports are listed (e.g. the same phone via both a TCP
+connection and mDNS), disconnect the duplicate:
+
+```bash
+adb disconnect <device-ip>:<port>
+```
+
+Or target a specific device explicitly:
+
+```bash
+make install SERIAL=<serial>
+```
+
+Use `make devices` to list connected devices.
 
 ### View Go logs from the app
 
@@ -94,23 +97,13 @@ adb logcat -d | grep "GoLog.*tailcat"
 ### Quick rebuild + redeploy (Kotlin only, no Go changes)
 
 ```bash
-cd android && ./gradlew assembleDebug --no-daemon && \
-adb install -r app/build/outputs/apk/debug/app-debug.apk && \
-adb shell am force-stop com.tailcat.android && \
-adb shell am start -n com.tailcat.android/.MainActivity
+cd android && ./gradlew assembleDebug --no-daemon && make install
 ```
 
 ### Quick rebuild + redeploy (Go changes included)
 
 ```bash
-# From repo root, in the Nix dev shell:
-gomobile bind -tags "$(go run ./internal/buildtags/printtags -android)" \
-  -androidapi 26 -o android/app/libs/tailcat.aar -target=android/arm64 \
-  ./android/bridge && \
-cd android && ./gradlew assembleDebug --no-daemon && \
-adb install -r app/build/outputs/apk/debug/app-debug.apk && \
-adb shell am force-stop com.tailcat.android && \
-adb shell am start -n com.tailcat.android/.MainActivity
+cd android && make install
 ```
 
 ### Go bridge unit tests
