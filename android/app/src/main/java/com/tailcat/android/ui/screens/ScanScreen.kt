@@ -319,10 +319,19 @@ fun ScanScreen(
                     else MaterialTheme.colorScheme.error,
                 )
 
-                // Actions: Save on the left, Reconnect and Disconnect
-                // clustered on the right.
+                // Actions: Save on the left, Reconnect and
+                // Disconnect/Clear clustered on the right.
                 Spacer(Modifier.height(4.dp))
                 val saved = connected && savedAddresses.contains(scannedAddress)
+                // The connection is live: an address is set and
+                // neither a loss nor a deliberate disconnect is in
+                // effect. The second action is Disconnect while live,
+                // Clear once the connection is down — there is
+                // nothing to disconnect then, only the address to
+                // wipe — so the pair is always either a greyed
+                // Reconnect next to Disconnect, or Reconnect next to
+                // Clear.
+                val connectionUp = connected && !connectionLost && !userDisconnected
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -364,21 +373,21 @@ fun ScanScreen(
                         }
                         TextButton(
                             onClick = {
-                                if (userDisconnected) {
-                                    onClearAddress()
-                                    probeResult = null
-                                    probeError = null
-                                } else {
+                                if (connectionUp) {
                                     onDisconnect()
                                     // Nothing of the old connection
                                     // lingers into the next one.
+                                    probeResult = null
+                                    probeError = null
+                                } else {
+                                    onClearAddress()
                                     probeResult = null
                                     probeError = null
                                 }
                             },
                             enabled = connected,
                         ) {
-                            Text(if (userDisconnected) "Clear" else "Disconnect")
+                            Text(if (connectionUp) "Disconnect" else "Clear")
                         }
                     }
                 }
