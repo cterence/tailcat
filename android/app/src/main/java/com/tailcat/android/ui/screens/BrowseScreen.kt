@@ -52,6 +52,13 @@ class BrowseState {
     var client by mutableStateOf<TailcatClient?>(null)
     var sftp by mutableStateOf<TailcatSFTPClient?>(null)
 
+    // Bumped when a failed operation closed the session: the connect
+    // effect keys on this and reconnects on its own. The tick exists
+    // so the effect never keys on the session itself — it sets the
+    // session mid-run, which would flip that key under it and cancel
+    // the effect in the middle of the first listing.
+    var reconnectTick by mutableStateOf(0)
+
     // Scroll position, kept with the listing so returning to the tab
     // restores it.
     val listState = LazyListState()
@@ -151,11 +158,11 @@ fun BrowseScreen(
     // in with the same address is a no-op — no re-probe, no reload.
     // A session lost to an error (closed by withSftp) reconnects and
     // relists the current directory on the next tab entry.
-    // Keyed on session presence too: a session that died mid-use
-    // (server restart, network drop) is closed by withSftp, and this
-    // effect then re-runs and reconnects on its own — the tab heals
-    // instead of spinning forever on a dead session.
-    LaunchedEffect(address, canRead, state.sftp == null) {
+    // Keyed on the reconnect tick as well: a session that died
+    // mid-use (server restart, network drop) is closed by withSftp,
+    // which bumps the tick, and this effect then reconnects and
+    // relists on its own — the tab heals instead of spinning forever.
+    LaunchedEffect(address, canRead, state.reconnectTick) {
         if (address.isEmpty()) {
             withContext(Dispatchers.IO) { state.closeConnection() }
             state.resetListing()
@@ -227,6 +234,8 @@ fun BrowseScreen(
                 }
                 state.sftp = null
                 state.client = null
+                // Tell the connect effect to reconnect and relist.
+                state.reconnectTick++
             }
             state.loading = false
         }
