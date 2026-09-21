@@ -142,6 +142,7 @@ fun ScanScreen(
             probeResult = null
             probeError = null
             probing = false
+            reconnecting = false
             connectingAddress = null
             return@LaunchedEffect
         }
@@ -319,19 +320,18 @@ fun ScanScreen(
                     else MaterialTheme.colorScheme.error,
                 )
 
-                // Actions: Save on the left, Reconnect and
-                // Disconnect/Clear clustered on the right.
+                // Actions: Save on the left; Clear and the single
+                // connect slot clustered on the right. Reconnect and
+                // Disconnect are never shown together — one slot
+                // swaps between them: Disconnect while the connection
+                // is live, Reconnect once it is down (lost, a
+                // deliberate disconnect, or a failed probe). Clear
+                // sits left of the slot and wipes the address; it
+                // only applies with no live connection.
                 Spacer(Modifier.height(4.dp))
                 val saved = connected && savedAddresses.contains(scannedAddress)
-                // The connection is live: an address is set and
-                // neither a loss nor a deliberate disconnect is in
-                // effect. The second action is Disconnect while live,
-                // Clear once the connection is down — there is
-                // nothing to disconnect then, only the address to
-                // wipe — so the pair is always either a greyed
-                // Reconnect next to Disconnect, or Reconnect next to
-                // Clear.
                 val connectionUp = connected && !connectionLost && !userDisconnected
+                val connectionDown = connected && (!connectionUp || probeError != null)
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
@@ -349,18 +349,34 @@ fun ScanScreen(
                     Row {
                         TextButton(
                             onClick = {
-                                reconnecting = true
-                                onReconnect()
-                                // Clear immediately so the old values
-                                // don't flash back while reconnecting.
+                                onClearAddress()
                                 probeResult = null
                                 probeError = null
-                                probeAttempt++
                             },
-                            // Greyed while the re-probe runs: re-tapping
-                            // mid-retry only queues another attempt.
-                            enabled = connected && !reconnecting &&
-                                (probeError != null || connectionLost || userDisconnected),
+                            enabled = connectionDown,
+                        ) {
+                            Text("Clear")
+                        }
+                        TextButton(
+                            onClick = {
+                                if (connectionDown) {
+                                    reconnecting = true
+                                    onReconnect()
+                                    // Clear immediately so the old values
+                                    // don't flash back while reconnecting.
+                                    probeAttempt++
+                                } else {
+                                    onDisconnect()
+                                    // Nothing of the old connection
+                                    // lingers into the next one.
+                                }
+                                probeResult = null
+                                probeError = null
+                            },
+                            // Greyed with its spinner while a probe or
+                            // reconnect is in flight: the slot shows
+                            // the swap target, not a live control.
+                            enabled = connected && !probing && !reconnecting,
                         ) {
                             if (reconnecting) {
                                 CircularProgressIndicator(
@@ -369,25 +385,7 @@ fun ScanScreen(
                                 )
                                 Spacer(Modifier.width(8.dp))
                             }
-                            Text("Reconnect")
-                        }
-                        TextButton(
-                            onClick = {
-                                if (connectionUp) {
-                                    onDisconnect()
-                                    // Nothing of the old connection
-                                    // lingers into the next one.
-                                    probeResult = null
-                                    probeError = null
-                                } else {
-                                    onClearAddress()
-                                    probeResult = null
-                                    probeError = null
-                                }
-                            },
-                            enabled = connected,
-                        ) {
-                            Text(if (connectionUp) "Disconnect" else "Clear")
+                            Text(if (connectionDown) "Reconnect" else "Disconnect")
                         }
                     }
                 }
