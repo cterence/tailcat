@@ -15,6 +15,8 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -30,6 +32,7 @@ import com.tailcat.android.TailcatConnectionListener
 import com.tailcat.android.TailcatKey
 import com.tailcat.android.TailcatServer
 import com.tailcat.android.addressKey
+import com.tailcat.android.keyAddress
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -57,7 +60,10 @@ data class ReceiveState(
     val sharedDir: String = "",
     // How the shared folder is served: "rw" (read & write), "ro"
     // (read-only), or "wo" (write-only drop box). See TailcatServer.startSFTP.
-    val serveMode: String = "rw",
+    val serveMode: String = "wo",
+    // When true, the user explicitly stopped listening: tabbing back
+    // into Receive does not auto-start again.
+    val stoppedByUser: Boolean = false,
     // When true, only devices with an address in the saved list may
     // connect; see bridge AllowedClients. On by default: an address
     // shared casually (QR, clipboard) should not admit the world.
@@ -72,10 +78,11 @@ data class PeerEntry(
     val active: Boolean,
 )
 
-// The shared-storage root, the default directory for "Start listening"
-// so SFTP works without picking anything. The SAF picker refuses to
-// grant the root "for privacy reasons", but the path-based serving
-// route under All Files Access can serve it.
+// The shared-storage root. Never the default for listening — serving
+// it would expose everything on the phone; it only pre-fills the
+// directory chooser and appears as the "All files" suggestion. The
+// SAF picker refuses to grant the root "for privacy reasons", but the
+// path-based serving route under All Files Access can serve it.
 private const val defaultShareRoot = "/storage/emulated/0"
 
 @Composable
@@ -106,13 +113,32 @@ fun ReceiveScreen(
     var showRotateDialog by remember { mutableStateOf(false) }
     var rotateWithPSK by remember { mutableStateOf(true) }
     var sendingAddress by remember { mutableStateOf(false) }
+    var showAddressActions by remember { mutableStateOf(false) }
+    var actionTarget by remember { mutableStateOf<ReceivedFile?>(null) }
+
+    // The identity's default address, shown on the card before the
+    // first start (and refreshed after the rotate dialog closes — a
+    // rotation replaces the key behind the address).
+    var defaultAddress by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(showRotateDialog) {
+        if (showRotateDialog) return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            defaultAddress = keyAddress(TailcatKey.loadOrCreate())
+        }
+    }
 
     // Derived from persisted state so the chosen directory survives
     // tab switches (the screen leaves composition; `state` does not).
-    val sharedDirPath = state.sharedDir.ifEmpty { null }
-    val sharedDirLabel = when (sharedDirPath) {
-        null -> null
-        defaultShareRoot -> "All files"
+    // The base state — nothing explicitly picked — serves the public
+    // Downloads folder write-only (a drop box), so tailcat cp works
+    // out of the box and the settings reflect what is actually served.
+    @Suppress("DEPRECATION")
+    val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        ?.absolutePath ?: "/storage/emulated/0/Download"
+    val sharedDirPath = state.sharedDir.ifEmpty { downloadsDir }
+    val sharedDirLabel = when {
+        state.sharedDir.isEmpty() -> "Downloads (default)"
+        sharedDirPath == defaultShareRoot -> "All files"
         else -> sharedDirPath.substringAfterLast('/').ifEmpty { sharedDirPath }
     }
 
@@ -122,7 +148,7 @@ fun ReceiveScreen(
     // privacy reasons", so paths can also be entered manually; both
     // routes require All Files Access, without which scoped storage
     // makes the folder list as empty over SFTP.
-    // The node keys of every saved device, for the "only saved devices"
+    // The node keys of every saved address, for the "only saved addresses"
     // allowlist. Unparsable addresses are skipped.
     fun savedKeys(): List<String> =
         savedAddresses.addresses.mapNotNull { addressKey(it.address) }
@@ -153,12 +179,22 @@ fun ReceiveScreen(
                     }
                     onServerChange(srv)
                     onStateChange {
-                        it.copy(address = addr, listening = true, starting = false, sharedDir = dir ?: "")
+                        it.copy(address = addr, listening = true, starting = false, sharedDir = dir ?: "", stoppedByUser = false)
                     }
                 }
             } catch (e: Exception) {
                 onStateChange { it.copy(starting = false, error = e.message) }
             }
+        }
+    }
+
+    // Tabbing into Receive starts listening by default (the server
+    // and its state live at the app level, so both survive tab
+    // switches). An explicit Stop sets stoppedByUser and wins: re-
+    // entering the tab does not silently restart.
+    LaunchedEffect(Unit) {
+        if (!state.listening && !state.starting && !state.stoppedByUser) {
+            startServer(sharedDirPath, state.serveMode, state.allowedOnly)
         }
     }
 
@@ -196,7 +232,8 @@ fun ReceiveScreen(
     // listening, restarts the server in raw receive mode (same address).
     fun forgetSharedDir() {
         onStateChange { it.copy(sharedDir = "") }
-        restartIfListening(null, state.serveMode, state.allowedOnly)
+        // Falls back to the Downloads drop box, not raw mode.
+        restartIfListening(downloadsDir, state.serveMode, state.allowedOnly)
     }
 
     // Gate + state update for making path the served directory.
@@ -216,10 +253,11 @@ fun ReceiveScreen(
         return true
     }
 
-    // Opens the directory chooser, pre-filled with the current choice
-    // (or the shared-storage root).
+    // Opens the directory chooser. The path starts empty unless
+    // changing an existing choice: what gets served must be picked
+    // deliberately, never pre-filled with the storage root.
     fun openDirChooser() {
-        pathInput = sharedDirPath ?: Environment.getExternalStorageDirectory()?.absolutePath ?: defaultShareRoot
+        pathInput = sharedDirPath ?: ""
         showDirChooser = true
     }
 
@@ -240,7 +278,7 @@ fun ReceiveScreen(
         }
     }
 
-    // While listening with the "only saved devices" allowlist on, a
+    // While listening with the "only saved addresses" allowlist on, a
     // device saved on the Connect tab is admitted on the running
     // engine immediately — no restart, no address change, no dropped
     // transfers. Keys already applied to this server instance are
@@ -262,7 +300,12 @@ fun ReceiveScreen(
     DisposableEffect(state.listening, sharedDirPath) {
         val dir = if (state.listening) sharedDirPath else null
         val observer = dir?.let { d ->
-            sharedDirObserver(d) { name, size ->
+            sharedDirObserver(
+                d,
+                onReceiving = { receiving ->
+                    onStateChange { it.copy(receiving = receiving) }
+                },
+            ) { name, size ->
                 onStateChange { s ->
                     // Skip duplicate events for the same file (same name
                     // and size as the last recorded entry).
@@ -285,17 +328,156 @@ fun ReceiveScreen(
             .verticalScroll(rememberScrollState())
             .padding(16.dp)
     ) {
-        Text("Receive", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(16.dp))
+        // The address card mirrors the Connect tab's connection card:
+        // a fixed address slot, plain status rows, and compact action
+        // rows at the bottom. The start/stop toggle lives in those
+        // rows, not in a big button above the card.
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Text("Your address:", style = MaterialTheme.typography.labelMedium)
+                // Same slot style as the Connect card: a fixed
+                // two-line bodyMedium, copyable via selection. The
+                // identity's default address shows even before the
+                // first start.
+                val shownAddress = state.address.ifEmpty { defaultAddress }
+                // Tap the address for the full address and its
+                // actions (Share, Rotate, device pairing) in a popup.
+                SelectionContainer {
+                    Text(
+                        shownAddress ?: "Loading address...",
+                        style = MaterialTheme.typography.bodyMedium,
+                        minLines = 2,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        color = if (shownAddress == null) MaterialTheme.colorScheme.onSurfaceVariant
+                        else MaterialTheme.colorScheme.onSurface,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showAddressActions = true },
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
 
-        // Directory and serve settings sit outside the listening-state
-        // branches: identical composables in both states, so starting
-        // or stopping the server never redraws this section — only the
-        // state-specific slot below changes.
+                // Relay health: the shared address is unreachable
+                // while the engine has no DERP relay connection, even
+                // though the server is listening. The bridge's
+                // watchdog rebuilds the engine automatically; while
+                // that is in progress, show the live retry count and
+                // a link to rebuild immediately.
+                var relayOnline by remember { mutableStateOf(true) }
+                var relayMisses by remember { mutableStateOf(0) }
+                var peers by remember { mutableStateOf<List<PeerEntry>>(emptyList()) }
+                LaunchedEffect(server) {
+                    while (true) {
+                        relayOnline = server?.relayOnline() ?: true
+                        relayMisses = server?.relayMisses() ?: 0
+                        peers = server?.peersJSON()?.let(::parsePeers) ?: emptyList()
+                        delay(3000)
+                    }
+                }
+                if (server == null) {
+                    Text(
+                        "Relay: –",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                } else if (relayOnline) {
+                    Text(
+                        "Relay: connected",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                } else {
+                    // Plain status row like the others: the bridge's
+                    // watchdog rebuilds the engine on its own, so no
+                    // manual repair control is needed.
+                    Text(
+                        "Relay: offline (retry ${relayMisses + 1})",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+                // Named peers (a saved address whose identity key
+                // matches) get a row each; unnamed one-off clients —
+                // every CLI command is a fresh ephemeral key —
+                // collapse into a single count line instead of
+                // stacking up as raw nodekeys.
+                val activePeers = peers.filter { it.active }
+                val keyAliases = savedAddresses.addresses.mapNotNull { s ->
+                    addressKey(s.address)?.let { it to s.alias }
+                }.toMap()
+                val named = activePeers.mapNotNull { p ->
+                    keyAliases[p.key]?.let { p to it }
+                }
+                val unnamed = activePeers.size - named.size
+                if (named.isNotEmpty() || unnamed > 0) {
+                    Text(
+                        "Connections: ${activePeers.size}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    for ((p, alias) in named) {
+                        Text(
+                            "$alias — ${if (p.curAddr.isNotEmpty()) "direct" else "relayed via ${p.relay}"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (p.curAddr.isNotEmpty()) MaterialTheme.colorScheme.primary
+                            else MaterialTheme.colorScheme.tertiary,
+                        )
+                    }
+                    if (unnamed > 0) {
+                        Text(
+                            "+$unnamed unnamed connection${if (unnamed == 1) "" else "s"}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+
+                // Start/stop is the only inline action; tapping the
+                // address above opens a popup with Share, Rotate, and
+                // device pairing, so nothing ever expands the card.
+                Spacer(Modifier.height(4.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    TextButton(
+                        onClick = {
+                            if (state.listening) {
+                                server?.stop()
+                                onServerChange(null)
+                                onStateChange { it.copy(listening = false, stoppedByUser = true) }
+                            } else {
+                                // Nothing explicitly picked serves the
+                                // base state: Downloads as a drop box.
+                                startServer(sharedDirPath, state.serveMode, state.allowedOnly)
+                            }
+                        },
+                        enabled = !state.starting,
+                    ) {
+                        if (state.starting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                            )
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        Text(if (state.listening) "Stop listening" else "Start listening")
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Text("Sharing settings", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(8.dp))
+        // Directory and serve settings: identical composables in both
+        // listening states, so starting or stopping the server never
+        // redraws this section.
         if (sharedDirLabel != null) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    "Shared: $sharedDirLabel",
+                    "Shared directory: $sharedDirLabel",
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.weight(1f),
                 )
@@ -303,7 +485,7 @@ fun ReceiveScreen(
                     onClick = ::forgetSharedDir,
                     enabled = !restarting,
                 ) {
-                    Text("Forget")
+                    Text("Reset")
                 }
             }
         }
@@ -318,291 +500,15 @@ fun ReceiveScreen(
             }
             Text(if (sharedDirLabel != null) "Change directory" else "Share directory")
         }
-        if (!state.listening && !state.starting && sharedDirLabel == null) {
-            Text(
-                "No directory picked — Start listening will share all files.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-        }
         Spacer(Modifier.height(8.dp))
         ServeSettings(
             mode = state.serveMode,
             allowedOnly = state.allowedOnly,
             enabled = !restarting && !state.starting,
-            savedCount = savedAddresses.addresses.size,
             onModeChange = ::setServeMode,
             onAllowedOnlyChange = ::setAllowedOnly,
         )
 
-        if (state.listening) {
-            Spacer(Modifier.height(16.dp))
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Your address:", style = MaterialTheme.typography.labelMedium)
-                    // Show only the first line by default; tap to
-                    // expand the full address. The SelectionContainer
-                    // still allows copying it in either state.
-                    var addressExpanded by remember { mutableStateOf(false) }
-                    SelectionContainer {
-                        Text(
-                            state.address,
-                            style = MaterialTheme.typography.bodySmall,
-                            softWrap = true,
-                            maxLines = if (addressExpanded) Int.MAX_VALUE else 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clickable { addressExpanded = !addressExpanded },
-                        )
-                    }
-                    if (!addressExpanded) {
-                        Text(
-                            "Tap to expand",
-                            style = MaterialTheme.typography.labelSmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    // Rotating replaces the identity behind this
-                    // address; compact because it is a rare, deliberate
-                    // action (a confirmation dialog follows).
-                    TextButton(
-                        onClick = { showRotateDialog = true },
-                    ) {
-                        Text(
-                            "Rotate address",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    // Relay health: the shared address is unreachable
-                    // while the engine has no DERP relay connection,
-                    // even though the server is listening. The bridge's
-                    // watchdog rebuilds the engine automatically; while
-                    // that is in progress, show a spinner with the live
-                    // retry count and a button to rebuild immediately.
-                    var relayOnline by remember { mutableStateOf(true) }
-                    var relayMisses by remember { mutableStateOf(0) }
-                    var peers by remember { mutableStateOf<List<PeerEntry>>(emptyList()) }
-                    LaunchedEffect(server) {
-                        while (true) {
-                            relayOnline = server?.relayOnline() ?: true
-                            relayMisses = server?.relayMisses() ?: 0
-                            peers = server?.peersJSON()?.let(::parsePeers) ?: emptyList()
-                            delay(3000)
-                        }
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    if (relayOnline) {
-                        Text(
-                            "Relay: connected",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary,
-                        )
-                    } else {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
-                            Spacer(Modifier.width(8.dp))
-                            Text(
-                                "Relay: offline — establishing connection (retry ${relayMisses + 1})",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.error,
-                                modifier = Modifier.weight(1f),
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            // A plain clickable Text, not a TextButton:
-                            // Material buttons' 48dp touch target makes
-                            // the whole status row huge.
-                            Text(
-                                "Repair now",
-                                style = MaterialTheme.typography.labelSmall,
-                                color = MaterialTheme.colorScheme.error,
-                                textDecoration = TextDecoration.Underline,
-                                modifier = Modifier.clickable {
-                                    scope.launch {
-                                        withContext(Dispatchers.IO) {
-                                            server?.restart()
-                                        }
-                                    }
-                                },
-                            )
-                        }
-                    }
-                    // Named peers (a saved address whose identity key
-                    // matches) get a row each; unnamed one-off clients —
-                    // every CLI command is a fresh ephemeral key —
-                    // collapse into a single count line instead of
-                    // stacking up as raw nodekeys.
-                    val activePeers = peers.filter { it.active }
-                    val keyAliases = savedAddresses.addresses.mapNotNull { s ->
-                        addressKey(s.address)?.let { it to s.alias }
-                    }.toMap()
-                    val named = activePeers.mapNotNull { p ->
-                        keyAliases[p.key]?.let { p to it }
-                    }
-                    val unnamed = activePeers.size - named.size
-                    if (named.isNotEmpty() || unnamed > 0) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "Active connections (${activePeers.size})",
-                            style = MaterialTheme.typography.titleSmall,
-                        )
-                        for ((p, alias) in named) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Text(
-                                    alias,
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.weight(1f),
-                                )
-                                Text(
-                                    if (p.curAddr.isNotEmpty()) "direct" else "relayed (${p.relay})",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = if (p.curAddr.isNotEmpty()) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.tertiary,
-                                )
-                            }
-                        }
-                        if (unnamed > 0) {
-                            Text(
-                                "+$unnamed unnamed connection${if (unnamed == 1) "" else "s"}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
-                    }
-                    Spacer(Modifier.height(12.dp))
-                    Button(
-                        onClick = {
-                            val sendIntent = Intent().apply {
-                                action = Intent.ACTION_SEND
-                                putExtra(Intent.EXTRA_TEXT, state.address)
-                                type = "text/plain"
-                            }
-                            context.startActivity(Intent.createChooser(sendIntent, "Share address"))
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Text("Share address")
-                    }
-
-                    // Pairing: the device connected to on the Connect
-                    // tab can be handed this address so it can also
-                    // reach the phone. Named after the saved alias, with
-                    // the outcome spelled out; when the device can't
-                    // accept it, say why instead of silently hiding.
-                    val remoteAlias = savedAddresses.addresses.firstOrNull {
-                        it.address == scannedAddress
-                    }?.alias
-                    val remoteName = remoteAlias ?: "the connected device"
-                    val remoteInfo = if (scannedAddress.isNotEmpty() && scannedAddress != state.address) {
-                        permCache.get(scannedAddress)
-                    } else null
-                    if (remoteInfo?.canWrite == true && state.address.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        TextButton(
-                            onClick = {
-                                if (sendingAddress) return@TextButton
-                                sendingAddress = true
-                                scope.launch {
-                                    var fileName = "tailcat-address.txt"
-                                    try {
-                                        withContext(Dispatchers.IO) {
-                                            val tmpFile = java.io.File(context.cacheDir, "tailcat-address.txt")
-                                            tmpFile.writeText(state.address + "\n")
-
-                                            val client = TailcatClient(scannedAddress, "")
-                                            client.pingWithTimeout(15)
-                                            val sftp = client.dialSFTP()
-                                            val remotePath = sftp.uploadFileGetPath(tmpFile.absolutePath, "/tailcat-address.txt")
-                                            sftp.close()
-                                            client.close()
-                                            tmpFile.delete()
-                                            fileName = remotePath.substringAfterLast('/')
-                                        }
-                                        Toast.makeText(context, "Address sent as $fileName", Toast.LENGTH_SHORT).show()
-                                    } catch (e: Exception) {
-                                        Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_LONG).show()
-                                    }
-                                    sendingAddress = false
-                                }
-                            },
-                            enabled = !sendingAddress,
-                        ) {
-                            if (sendingAddress) {
-                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(if (sendingAddress) "Sending..." else "Send my address to $remoteName")
-                        }
-                        Text(
-                            "Uploads tailcat-address.txt with your address, so $remoteName can also reach your phone.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    } else if (remoteInfo != null && state.address.isNotEmpty()) {
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            "$remoteName doesn't accept uploads, so your address can't be sent to it.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-            }
-
-            Spacer(Modifier.height(16.dp))
-
-            Button(
-                onClick = {
-                    server?.stop()
-                    onServerChange(null)
-                    onStateChange { it.copy(listening = false) }
-                },
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = MaterialTheme.colorScheme.error
-                ),
-            ) {
-                Text("Stop listening")
-            }
-        } else {
-            // The Start button stays in place while starting: the
-            // spinner appears inside it, so neither the layout height
-            // nor the scroll position jumps.
-            Spacer(Modifier.height(12.dp))
-            Button(
-                onClick = {
-                    // Without a picked directory, default to the
-                    // shared-storage root so listening always means
-                    // SFTP (the SAF picker can't grant the root, but
-                    // the path-based route under All Files Access can).
-                    // Starting with no SFTP directory at all would
-                    // leave ls/scp from a peer with nothing to list.
-                    var dir = sharedDirPath
-                    if (dir == null) {
-                        dir = if (adoptShareDir(defaultShareRoot)) defaultShareRoot else return@Button
-                    }
-                    startServer(dir, state.serveMode, state.allowedOnly)
-                },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !state.starting,
-            ) {
-                if (state.starting) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(20.dp),
-                        strokeWidth = 2.dp,
-                        color = MaterialTheme.colorScheme.onPrimary,
-                    )
-                    Spacer(Modifier.width(12.dp))
-                }
-                Text(if (state.starting) "Starting server..." else "Start listening")
-            }
-        }
-
-        if (state.receiving) {
-            Spacer(Modifier.height(8.dp))
-            Text("Receiving file...", color = MaterialTheme.colorScheme.primary)
-        }
 
         state.error?.let {
             Spacer(Modifier.height(8.dp))
@@ -611,17 +517,99 @@ fun ReceiveScreen(
 
         Spacer(Modifier.height(16.dp))
 
-        if (state.receivedFiles.isNotEmpty()) {
-            Text("Received files:", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            for (file in state.receivedFiles) {
-                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
-                    Text(file.name, style = MaterialTheme.typography.bodyLarge)
-                    Text("${file.size} bytes", style = MaterialTheme.typography.bodySmall)
-                }
-                HorizontalDivider()
+        // Received files: the same row shape as the Browse tab, with
+        // Open and Remove actions.
+        Text("Received files:", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(8.dp))
+        for (file in state.receivedFiles) {
+            ListItem(
+                headlineContent = {
+                    Text(
+                        file.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                },
+                supportingContent = {
+                    Text(
+                        formatBytes(file.size),
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                },
+                leadingContent = {
+                    Icon(
+                        Icons.AutoMirrored.Filled.InsertDriveFile,
+                        contentDescription = "File",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { actionTarget = file },
+            )
+            HorizontalDivider()
+        }
+        // Receiving indicator while a file is incoming; it sits below
+        // the list so nothing above ever shifts.
+        if (state.receiving) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    "Receiving file...",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
             }
         }
+    }
+
+    // Tapping a received file opens this: its actions, keeping the
+    // list rows free of buttons.
+    if (actionTarget != null) {
+        val file = actionTarget!!
+        AlertDialog(
+            onDismissRequest = { actionTarget = null },
+            title = { Text(file.name, style = MaterialTheme.typography.titleMedium) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val uri = findDownloadsUri(context, file.name)
+                        if (uri != null) {
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                setDataAndType(uri, getMimeType(file.name))
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            }
+                            try {
+                                context.startActivity(intent)
+                            } catch (e: Exception) {
+                                Toast.makeText(context, "Cannot open: ${e.message}", Toast.LENGTH_SHORT).show()
+                            }
+                        } else {
+                            Toast.makeText(context, "File not found in MediaStore", Toast.LENGTH_SHORT).show()
+                        }
+                        actionTarget = null
+                    },
+                ) {
+                    Text("Open")
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        if (removeReceivedFile(context, sharedDirPath, file.name)) {
+                            onStateChange { s -> s.copy(receivedFiles = s.receivedFiles - file) }
+                        } else {
+                            Toast.makeText(context, "Could not remove ${file.name}", Toast.LENGTH_SHORT).show()
+                        }
+                        actionTarget = null
+                    },
+                ) {
+                    Text("Remove", color = MaterialTheme.colorScheme.error)
+                }
+            },
+        )
     }
 
     // All Files Access gate: shown when a folder was picked but the
@@ -705,6 +693,10 @@ fun ReceiveScreen(
             confirmButton = {
                 TextButton(onClick = {
                     val path = pathInput.trim()
+                    if (path.isEmpty()) {
+                        Toast.makeText(context, "Pick or type a directory to serve.", Toast.LENGTH_SHORT).show()
+                        return@TextButton
+                    }
                     if (adoptShareDir(path)) {
                         showDirChooser = false
                         restartIfListening(path, state.serveMode, state.allowedOnly)
@@ -719,6 +711,103 @@ fun ReceiveScreen(
             dismissButton = {
                 TextButton(onClick = { showDirChooser = false }) {
                     Text("Cancel")
+                }
+            },
+        )
+    }
+
+    // Tapping the address opens this: the full address (copyable)
+    // plus its actions, keeping the card itself free of buttons that
+    // appear and expand it.
+    if (showAddressActions) {
+        val popupAddress = state.address.ifEmpty { defaultAddress }
+        val remoteAlias = savedAddresses.addresses.firstOrNull {
+            it.address == scannedAddress
+        }?.alias
+        val remoteInfo = if (scannedAddress.isNotEmpty() && scannedAddress != state.address) {
+            permCache.get(scannedAddress)
+        } else null
+        val canPair = remoteInfo?.canWrite == true && popupAddress != null
+        AlertDialog(
+            onDismissRequest = { showAddressActions = false },
+            title = { Text("Your address") },
+            text = {
+                Column {
+                    SelectionContainer {
+                        Text(
+                            popupAddress ?: "No address yet.",
+                            style = MaterialTheme.typography.bodySmall,
+                            softWrap = true,
+                        )
+                    }
+                    // Pairing: hand this address to the device the
+                    // Connect tab is connected to, so it can also
+                    // reach the phone. The toast reports the outcome.
+                    if (canPair) {
+                        Spacer(Modifier.height(8.dp))
+                        TextButton(
+                            onClick = {
+                                if (sendingAddress) return@TextButton
+                                sendingAddress = true
+                                scope.launch {
+                                    var fileName = "tailcat-address.txt"
+                                    try {
+                                        withContext(Dispatchers.IO) {
+                                            val tmpFile = java.io.File(context.cacheDir, "tailcat-address.txt")
+                                            tmpFile.writeText(popupAddress + "\n")
+
+                                            val client = TailcatClient(scannedAddress, "")
+                                            client.pingWithTimeout(15)
+                                            val sftp = client.dialSFTP()
+                                            val remotePath = sftp.uploadFileGetPath(tmpFile.absolutePath, "/tailcat-address.txt")
+                                            sftp.close()
+                                            client.close()
+                                            tmpFile.delete()
+                                            fileName = remotePath.substringAfterLast('/')
+                                        }
+                                        Toast.makeText(context, "Address sent as $fileName", Toast.LENGTH_SHORT).show()
+                                    } catch (e: Exception) {
+                                        Toast.makeText(context, "Error: ${e.message}", Toast.LENGTH_LONG).show()
+                                    }
+                                    sendingAddress = false
+                                }
+                            },
+                            enabled = !sendingAddress,
+                        ) {
+                            if (sendingAddress) {
+                                CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(
+                                if (sendingAddress) "Sending..."
+                                else if (remoteAlias != null) "Send to $remoteAlias"
+                                else "Send address"
+                            )
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val sendIntent = Intent().apply {
+                            action = Intent.ACTION_SEND
+                            putExtra(Intent.EXTRA_TEXT, popupAddress)
+                            type = "text/plain"
+                        }
+                        context.startActivity(Intent.createChooser(sendIntent, "Share address"))
+                    },
+                    enabled = popupAddress != null,
+                ) {
+                    Text("Share")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showAddressActions = false
+                    showRotateDialog = true
+                }) {
+                    Text("Rotate")
                 }
             },
         )
@@ -750,7 +839,7 @@ fun ReceiveScreen(
                             Text(
                                 "Recommended: the address itself stays a secret credential. " +
                                     "Without it, the address is public information — pair it with " +
-                                    "'Only saved devices may connect'.",
+                                    "'Only saved addresses may connect'.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
@@ -866,7 +955,6 @@ private fun ServeSettings(
     mode: String,
     allowedOnly: Boolean,
     enabled: Boolean,
-    savedCount: Int,
     onModeChange: (String) -> Unit,
     onAllowedOnlyChange: (Boolean) -> Unit,
 ) {
@@ -886,13 +974,6 @@ private fun ServeSettings(
             Spacer(Modifier.width(4.dp))
         }
     }
-    if (mode == "wo") {
-        Text(
-            "Drop box: devices can send you files but cannot list or read anything.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-    }
     Row(verticalAlignment = Alignment.CenterVertically) {
         Switch(
             checked = allowedOnly,
@@ -900,37 +981,42 @@ private fun ServeSettings(
             enabled = enabled,
         )
         Spacer(Modifier.width(8.dp))
-        Column {
-            Text("Only saved devices may connect", style = MaterialTheme.typography.bodyMedium)
-            if (savedCount == 0) {
-                Text(
-                    "No saved devices yet — save one on the Connect tab first.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.error,
-                )
-            }
-        }
+        Text("Only saved addresses may connect", style = MaterialTheme.typography.bodyMedium)
     }
 }
 
 /**
  * Watches a served directory for files written or moved into it, so
- * SFTP uploads appear in the received list. The String constructor of
+ * SFTP uploads appear in received list. A file being created or
+ * modified (but not yet closed) reports receiving = true, so the UI
+ * can show its spinner during the transfer. The String constructor of
  * FileObserver is deprecated in favor of a File one that needs API 29;
  * the app's minSdk is 26, so the String form is the only option.
  */
 @Suppress("DEPRECATION")
-private fun sharedDirObserver(dir: String, onFile: (name: String, size: Long) -> Unit): FileObserver =
-    object : FileObserver(dir, FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO) {
+private fun sharedDirObserver(
+    dir: String,
+    onReceiving: (Boolean) -> Unit,
+    onFile: (name: String, size: Long) -> Unit,
+): FileObserver =
+    object : FileObserver(
+        dir,
+        FileObserver.CREATE or FileObserver.MODIFY or
+            FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO,
+    ) {
         override fun onEvent(event: Int, path: String?) {
             if (path == null) return
-            // Uploads from this app arrive as a growing ".part" file
-            // renamed into place on completion; record only the final
-            // name when the rename lands, never the intermediate.
-            if (path.endsWith(".part")) return
             val f = File(dir, path)
-            if (!f.isFile) return
-            onFile(path, f.length())
+            if (event and (FileObserver.CREATE or FileObserver.MODIFY) != 0) {
+                if (!f.isFile) return
+                onReceiving(true)
+                return
+            }
+            if (event and (FileObserver.CLOSE_WRITE or FileObserver.MOVED_TO) != 0) {
+                onReceiving(false)
+                if (!f.isFile) return
+                onFile(path, f.length())
+            }
         }
     }
 
@@ -958,16 +1044,16 @@ private fun parsePeers(json: String): List<PeerEntry> {
 
 /**
  * Real, OS-provided candidate directories for the chooser: the
- * shared-storage root, the public folders that exist on this device,
- * and any secondary volumes (SD cards). Nothing is guessed. The
- * deprecated Environment accessors are the right tool here: only the
- * paths are used — the permission comes from All Files Access, not
- * from SAF grants.
+ * public folders that exist on this device and any secondary volumes
+ * (SD cards). Nothing is guessed, and the storage root is
+ * deliberately absent — serving it stays possible by typing its
+ * path, but it is never one tap away. The deprecated Environment
+ * accessors are the right tool here: only the paths are used — the
+ * permission comes from All Files Access, not from SAF grants.
  */
 @Suppress("DEPRECATION")
 private fun suggestedShareDirs(context: Context): List<Pair<String, String>> {
-    val root = Environment.getExternalStorageDirectory()?.absolutePath ?: defaultShareRoot
-    val out = mutableListOf("All files" to root)
+    val out = mutableListOf<Pair<String, String>>()
     for ((label, envDir) in listOf(
         "Downloads" to Environment.DIRECTORY_DOWNLOADS,
         "DCIM" to Environment.DIRECTORY_DCIM,
@@ -986,4 +1072,29 @@ private fun suggestedShareDirs(context: Context): List<Pair<String, String>> {
         if (File(volRoot).isDirectory) out.add(volRoot.substringAfterLast('/') to volRoot)
     }
     return out
+}
+
+/** MediaStore lookup for a received file by display name under Download. */
+private fun findDownloadsUri(context: Context, name: String): Uri? {
+    val filesUri = MediaStore.Files.getContentUri("external")
+    val projection = arrayOf(MediaStore.MediaColumns._ID)
+    val selection = "${MediaStore.MediaColumns.DISPLAY_NAME} = ? AND ${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?"
+    val selectionArgs = arrayOf(name, "%Download%")
+    val sortOrder = "${MediaStore.MediaColumns._ID} DESC"
+    context.contentResolver.query(filesUri, projection, selection, selectionArgs, sortOrder)?.use { cursor ->
+        if (cursor.moveToFirst()) {
+            return Uri.withAppendedPath(filesUri, cursor.getLong(0).toString())
+        }
+    }
+    return null
+}
+
+/**
+ * Deletes a received file: from the served directory by path first,
+ * then via MediaStore (for files the app inserted there).
+ */
+private fun removeReceivedFile(context: Context, dir: String, name: String): Boolean {
+    if (File(dir, name).delete()) return true
+    val uri = findDownloadsUri(context, name) ?: return false
+    return context.contentResolver.delete(uri, null, null) > 0
 }

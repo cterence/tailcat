@@ -267,6 +267,31 @@ func RotateKey(withPSK bool) (string, error) {
 	return string(data), nil
 }
 
+// KeyAddress returns the tailcat address for the identity keyJSON
+// (as produced by LoadOrCreateKey) without starting a server: the
+// key's public identity, expanded with the DERP map and
+// auto-selecting the nearest region the way NewServer will. Used to
+// show the address before the first server start; it fails offline
+// (no DERP map), and callers show the address once it succeeds.
+func KeyAddress(keyJSON string) (string, error) {
+	pk, err := parseKey(keyJSON)
+	if err != nil {
+		return "", fmt.Errorf("key: %w", err)
+	}
+	ci := pk.Public
+	if ci.RegionID == 0 {
+		// A key that has never served has no pinned region:
+		// auto-select like NewServer does.
+		ci.RegionID = -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := ci.Expand(ctx, tailcat.ExpandForServer); err != nil {
+		return "", fmt.Errorf("Expand: %w", err)
+	}
+	return string(ci.Addr()), nil
+}
+
 // parseKey unmarshals a JSON-serialized tailcat.PrivateKey.
 func parseKey(keyJSON string) (*tailcat.PrivateKey, error) {
 	if keyJSON == "" {
@@ -1185,23 +1210,22 @@ func (s *SFTPClient) uploadFile(localPath, remotePath string, progress ProgressL
 		// itself proceeds.
 	}
 
-	// Upload under a .part name and rename into place on completion:
-	// a file only ever appears at its final name once it is complete,
-	// and an aborted upload leaves nothing behind. The final name is
-	// chosen free up front (the old flow created the empty final file
-	// immediately, which was itself a misleading "incomplete" file).
-	finalPath := s.uniqueRemotePath(remotePath)
-	partPath := finalPath + ".part"
-	if _, err := s.sc.Stat(partPath); err == nil {
-		// A stale part from an attempt that crashed before its
-		// cleanup — incomplete by definition, so replace it.
-		if err := s.sc.Remove(partPath); err != nil {
-			return 0, finalPath, fmt.Errorf("remove stale %s: %w", partPath, err)
+	// Upload straight to the final name: it is chosen free up front
+	// and created exclusively, with numbered variants as a fallback
+	// when the name is taken between the stat and the create. An
+	// aborted or failed upload removes the partial file, so nothing
+	// incomplete stays behind.
+	dst := s.uniqueRemotePath(remotePath)
+	var w *sftp.File
+	for i := 0; ; i++ {
+		w, err = s.sc.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
+		if err == nil {
+			break
 		}
-	}
-	w, err := s.sc.OpenFile(partPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL)
-	if err != nil {
-		return 0, finalPath, fmt.Errorf("create remote: %w", err)
+		if i >= 999 {
+			return 0, dst, fmt.Errorf("create remote: %w", err)
+		}
+		dst = numberedPath(remotePath, i+1)
 	}
 
 	complete := false
@@ -1211,30 +1235,16 @@ func (s *SFTPClient) uploadFile(localPath, remotePath string, progress ProgressL
 		// may itself be dead.
 		if !complete {
 			w.Close()
-			s.sc.Remove(partPath)
+			s.sc.Remove(dst)
 		}
 	}()
 
 	n, err := io.Copy(w, src)
 	if err != nil {
-		return n, finalPath, fmt.Errorf("copy: %w (partial %s removed)", err, partPath)
+		return n, dst, fmt.Errorf("copy: %w (partial %s removed)", err, dst)
 	}
 	if err := w.Close(); err != nil {
-		return n, finalPath, fmt.Errorf("close remote: %w", err)
-	}
-
-	// Rename the completed part into place. The final name was chosen
-	// free; if it was taken meanwhile, fall back to numbered variants
-	// like the old exclusive-create flow did.
-	dst := finalPath
-	for i := 0; ; i++ {
-		if err := s.sc.Rename(partPath, dst); err == nil {
-			break
-		}
-		if i >= 999 {
-			return n, dst, fmt.Errorf("rename %s: no free destination", partPath)
-		}
-		dst = numberedPath(finalPath, i+1)
+		return n, dst, fmt.Errorf("close remote: %w", err)
 	}
 	complete = true
 	if progress != nil && pr != nil {
@@ -1415,10 +1425,20 @@ type CheckPermissionsResult struct {
 	CanWrite bool
 }
 
-// CheckPermissions probes the remote SFTP server to determine read and
-// write permissions. It tries listing the root directory (read test) and
-// creating then removing a temporary file (write test). The client must
-// have been pinged first.
+// CheckPermissions probes the remote SFTP server to determine read
+// and write permissions, without creating or modifying anything on
+// the remote. The read test lists the root directory. The write test
+// chmods an existing listed file to the mode it already has — a
+// no-op that read-write serves execute and read-only ones deny at
+// the SFTP layer, before any filesystem call. A server that denies
+// listing is a write-only drop box, the only serve mode without
+// reads: it accepts uploads by definition, and probing it with a
+// file would leave the file behind forever, since a drop box denies
+// removing what a session wrote. Wherever the probe cannot decide —
+// no file to chmod, or errors that are neither success nor
+// permission — write is granted optimistically: a wrong guess fails
+// at the next actual upload, which surfaces the error in the UI.
+// The client must have been pinged first.
 func (c *Client) CheckPermissions() (*CheckPermissionsResult, error) {
 	sftp, err := c.DialSFTP()
 	if err != nil {
@@ -1426,30 +1446,38 @@ func (c *Client) CheckPermissions() (*CheckPermissionsResult, error) {
 	}
 	defer sftp.Close()
 
-	canRead := true
-	canWrite := true
-
-	// Read test: try listing the root directory.
+	// Read test: list the root directory (no side effects).
 	entries, err := sftp.sc.ReadDir("/")
 	if err != nil {
-		canRead = false
-	}
-	_ = entries
-
-	// Write test: try creating and removing a temporary file.
-	testPath := "/.__tailcat_perm_test__"
-	f, err := sftp.sc.OpenFile(testPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
-	if err != nil {
-		canWrite = false
-	} else {
-		f.Close()
-		sftp.sc.Remove(testPath)
+		// Listing denied: a write-only drop box. It accepts uploads
+		// by definition, so report writable without touching the
+		// filesystem — a probe file there could never be removed.
+		return &CheckPermissionsResult{CanRead: false, CanWrite: true}, nil
 	}
 
-	return &CheckPermissionsResult{
-		CanRead:  canRead,
-		CanWrite: canWrite,
-	}, nil
+	// Write test: chmod an existing file to the mode it already has.
+	// The mode comes from the listing itself, so the chmod is a
+	// no-op. Read-write serves execute it; read-only ones deny it at
+	// the SFTP layer, before any filesystem call.
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		err := sftp.sc.Chmod("/"+e.Name(), e.Mode().Perm())
+		if err == nil {
+			return &CheckPermissionsResult{CanRead: true, CanWrite: true}, nil
+		}
+		if errors.Is(err, os.ErrPermission) {
+			return &CheckPermissionsResult{CanRead: true, CanWrite: false}, nil
+		}
+		// Another error (the file vanished between the listing and
+		// the chmod): try the next file.
+	}
+
+	// No file decided the answer: grant write optimistically, and
+	// let a failed upload surface the server's real answer in the
+	// UI.
+	return &CheckPermissionsResult{CanRead: true, CanWrite: true}, nil
 }
 
 // Close releases the client's network resources.

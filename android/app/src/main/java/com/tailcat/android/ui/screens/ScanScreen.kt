@@ -1,29 +1,78 @@
 package com.tailcat.android.ui.screens
 
 import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.content.pm.PackageManager
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import com.tailcat.android.SavedAddresses
+import com.tailcat.android.addressKey
 import com.tailcat.android.ocr.TokenScanner
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 
+/**
+ * One watchdog disco ping: live connection state, refreshed every 3s.
+ * seq makes every ping a distinct value, so state keyed on it (the
+ * latency dots timer) restarts even when the measurements are equal.
+ */
+data class LivePing(val seq: Long, val latencyMs: Long, val direct: Boolean, val via: String)
+
+/**
+ * Fully static layout: every section always exists in the same place
+ * and at the same height. State changes only swap text and the
+ * enabled/greyed state of controls; nothing ever appears, disappears,
+ * or moves. The camera preview is the one exception to the "always
+ * visible" rule and lives in a full-screen overlay so opening it
+ * never reflows the tab.
+ */
 @Composable
 fun ScanScreen(
     scannedAddress: String,
     onAddressScanned: (String) -> Unit,
     onUseAddress: () -> Unit,
+    // Disconnect stops the connection but keeps the address on the
+    // card; Reconnect brings it back without re-scanning.
+    onDisconnect: () -> Unit,
+    // Clear resets the card completely: only offered once the
+    // connection is already disconnected.
     onClearAddress: () -> Unit,
+    // True when the watchdog lost the connection unexpectedly: the
+    // card shows "connection lost".
+    connectionLost: Boolean,
+    // True when the user disconnected deliberately: the card shows
+    // "disconnected" instead of clearing.
+    userDisconnected: Boolean,
+    onReconnect: () -> Unit,
+    // The latest watchdog ping: latency, connection type, measured
+    // continuously while the connection is alive.
+    livePing: LivePing?,
+    // Bumped when the watchdog's periodic recheck noticed a permission
+    // change: re-read the fresh cache into the card.
+    probeRefreshTick: Int,
     permCache: PermissionCache,
     savedAddresses: SavedAddresses,
     modifier: Modifier = Modifier,
@@ -39,11 +88,15 @@ fun ScanScreen(
         ActivityResultContracts.RequestPermission()
     ) { granted -> hasCameraPermission = granted }
 
-    // Camera is off by default; user taps "Open camera" to start scanning.
-    // Auto-closes when a valid tc... address is scanned.
+    // Camera lives in a full-screen overlay while active; the tab
+    // below keeps its layout at all times.
     var cameraActive by remember { mutableStateOf(false) }
 
     var manualAddress by remember { mutableStateOf("") }
+    // The manual paste form is collapsed by default: scanning or a
+    // saved device is the common path, and keeping the form folded
+    // leaves the rest of the tab uncluttered.
+    var showManualInput by remember { mutableStateOf(false) }
 
     // Save dialog state
     var showSaveDialog by remember { mutableStateOf(false) }
@@ -59,6 +112,9 @@ fun ScanScreen(
     // Remove confirmation state: the saved address pending removal.
     var removeTarget by remember { mutableStateOf<String?>(null) }
 
+    // Tapping the address opens it in full, copyable.
+    var showAddressDialog by remember { mutableStateOf(false) }
+
     // Probe results: connection type and permissions.
     // Initialize from cache so results don't flash on tab switch.
     val cachedInfo = if (scannedAddress.isNotEmpty() && scannedAddress.startsWith("tc")) permCache.get(scannedAddress) else null
@@ -69,16 +125,20 @@ fun ScanScreen(
         })
     }
     var probeError by remember { mutableStateOf<String?>(null) }
-    var probeStatus by remember { mutableStateOf("") }
-    // Incremented by the Retry button to re-run the probe.
+    // Incremented by the Retry control to re-run the probe.
     var probeAttempt by remember { mutableStateOf(0) }
+    // True between a Reconnect tap and the end of the probe it
+    // triggers: the button stays greyed with its spinner for exactly
+    // that window. A first-connection probe never sets it — its
+    // spinner lives in the connection row.
+    var reconnecting by remember { mutableStateOf(false) }
 
     // Auto-probe when a new address is scanned — but skip if already cached
     LaunchedEffect(scannedAddress, probeAttempt) {
         if (scannedAddress.isEmpty() || !scannedAddress.startsWith("tc")) {
             probeResult = null
             probeError = null
-            probeStatus = ""
+            probing = false
             return@LaunchedEffect
         }
         val cached = permCache.get(scannedAddress)
@@ -86,81 +146,346 @@ fun ScanScreen(
             probeResult = cached.toProbeResult()
             probing = false
             probeError = null
-            probeStatus = ""
+            reconnecting = false
             return@LaunchedEffect
         }
         probing = true
         probeError = null
         probeResult = null
-        probeStatus = "Pinging..."
         try {
-            val info = probeAddress(scannedAddress, permCache) { probeStatus = it }
+            val info = probeAddress(scannedAddress, permCache)
             probeResult = info.toProbeResult()
+        } catch (e: CancellationException) {
+            // Cancelled (a new attempt superseded this one): not an
+            // error, and never displayed as one.
+            throw e
         } catch (e: Exception) {
             probeError = e.message
         }
         probing = false
-        probeStatus = ""
+        reconnecting = false
     }
 
-    Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text("Connect", style = MaterialTheme.typography.headlineMedium)
-        Spacer(Modifier.height(16.dp))
+    // The watchdog's periodic recheck updated the cache (the remote
+    // serve mode changed); re-read it into the card.
+    LaunchedEffect(probeRefreshTick) {
+        if (probeRefreshTick > 0) probeAttempt++
+    }
 
-        if (!hasCameraPermission) {
-            Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                Text("Grant camera permission")
-            }
-        } else if (cameraActive) {
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-            ) {
-                TokenScanner(
-                    modifier = Modifier.fillMaxSize(),
-                    onToken = { token ->
-                        // Only accept tokens that look like tailcat addresses
-                        if (token.startsWith("tc") && token.length > 10 && token != scannedAddress) {
-                            cameraActive = false
-                            onAddressScanned(token)
-                        }
-                    },
+    // The watchdog keeps pinging through a lost connection and flips
+    // connectionLost back off when the server returns; that recovery
+    // re-probes, so the fresh serve mode's permissions show instead of
+    // the stale pre-loss values.
+    var wasLost by remember { mutableStateOf(false) }
+    LaunchedEffect(connectionLost) {
+        if (connectionLost) {
+            wasLost = true
+        } else if (wasLost) {
+            wasLost = false
+            probeResult = null
+            probeError = null
+            probeAttempt++
+        }
+    }
+
+    val connected = scannedAddress.isNotEmpty()
+
+    // Recognize the connected device among the saved ones: a saved
+    // entry may hold the short-form address while a scan delivers the
+    // full one, so match on the node key rather than the address text.
+    val scannedKey = if (connected) addressKey(scannedAddress) else null
+    val matchedAlias = if (scannedKey == null) null
+        else savedAddresses.addresses.firstOrNull { addressKey(it.address) == scannedKey }?.alias
+
+    // Fixed sections on top; the saved-address list at the bottom is
+    // the only scrollable element, bounded by the remaining height.
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(16.dp)
+    ) {
+        // Connection card, always present and always the same height:
+        // disconnected shows a hint in the address slot, the three
+        // status rows show "–", and every control is greyed. Connecting
+        // swaps text and enables controls — nothing moves.
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Address:", style = MaterialTheme.typography.labelMedium)
+                    if (matchedAlias != null) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            matchedAlias,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+                // Both states share the same style and the same
+                // two-line slot: connecting swaps text only, never
+                // size or height.
+                // Tap the address (when connected) to see it in full.
+                SelectionContainer {
+                    Text(
+                        if (connected) scannedAddress else "Not connected",
+                        style = MaterialTheme.typography.bodyMedium,
+                        minLines = 2,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                        color = if (connected) MaterialTheme.colorScheme.onSurface
+                        else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (connected) Modifier.clickable { showAddressDialog = true }
+                                else Modifier
+                            ),
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+
+                val connText = when {
+                    !connected -> "–"
+                    probing -> "checking…"
+                    connectionLost -> "connection lost"
+                    userDisconnected -> "disconnected"
+                    probeError != null -> "unreachable: $probeError"
+                    livePing != null ->
+                        if (livePing!!.direct) "direct (P2P)" else "relayed via ${livePing!!.via}"
+                    probeResult != null ->
+                        if (probeResult!!.direct) "direct (P2P)" else "relayed via ${probeResult!!.via}"
+                    else -> "–"
+                }
+                if (probing) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "Connection: checking…",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    Text(
+                        "Connection: $connText",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            connectionLost || probeError != null -> MaterialTheme.colorScheme.error
+                            userDisconnected -> MaterialTheme.colorScheme.onSurfaceVariant
+                            livePing?.direct == true || probeResult?.direct == true -> MaterialTheme.colorScheme.primary
+                            livePing != null || probeResult != null -> MaterialTheme.colorScheme.tertiary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                val latencyText = when {
+                    connectionLost || userDisconnected || probing || probeError != null -> "–"
+                    livePing != null -> "${livePing!!.latencyMs} ms"
+                    else -> "${probeResult?.latencyMs ?: "–"} ms"
+                }
+                // Dots mark the value as continuously re-measured:
+                // one dot per second since the last watchdog ping. They
+                // run as soon as the watchdog is active — right after
+                // the connect probe, before its first ping even lands —
+                // and reset whenever a fresh ping arrives.
+                val dotsActive = connected && !connectionLost && !userDisconnected && !probing
+                var dots by remember { mutableStateOf(0) }
+                LaunchedEffect(dotsActive, livePing) {
+                    if (!dotsActive) {
+                        dots = 0
+                        return@LaunchedEffect
+                    }
+                    dots = 0
+                    repeat(3) {
+                        delay(1000)
+                        dots++
+                    }
+                }
+                Text(
+                    "Latency: $latencyText" + if (dotsActive) ".".repeat(dots) else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                OutlinedButton(
-                    onClick = { cameraActive = false },
-                    modifier = Modifier
-                        .align(Alignment.BottomCenter)
-                        .padding(bottom = 16.dp),
+                val permParts = mutableListOf<String>()
+                if (!connectionLost && !userDisconnected) {
+                    probeResult?.let { r ->
+                        if (r.canRead) permParts.add("Read")
+                        if (r.canWrite) permParts.add("Write")
+                    }
+                }
+                if (permParts.isEmpty()) permParts.add("–")
+                Text(
+                    "Permissions: ${permParts.joinToString(" + ")}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (probeResult == null) MaterialTheme.colorScheme.onSurfaceVariant
+                    else if (probeResult!!.canRead || probeResult!!.canWrite) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.error,
+                )
+
+                // Actions: Save on the left, Reconnect and Disconnect
+                // clustered on the right.
+                Spacer(Modifier.height(4.dp))
+                val saved = connected && savedAddresses.contains(scannedAddress)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text("Close camera")
+                    TextButton(
+                        onClick = {
+                            aliasInput = ""
+                            showSaveDialog = true
+                        },
+                        enabled = connected && !saved,
+                    ) {
+                        Text(if (saved) "Saved" else "Save")
+                    }
+                    Row {
+                        TextButton(
+                            onClick = {
+                                reconnecting = true
+                                onReconnect()
+                                // Clear immediately so the old values
+                                // don't flash back while reconnecting.
+                                probeResult = null
+                                probeError = null
+                                probeAttempt++
+                            },
+                            // Greyed while the re-probe runs: re-tapping
+                            // mid-retry only queues another attempt.
+                            enabled = connected && !reconnecting &&
+                                (probeError != null || connectionLost || userDisconnected),
+                        ) {
+                            if (reconnecting) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(16.dp),
+                                    strokeWidth = 2.dp,
+                                )
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text("Reconnect")
+                        }
+                        TextButton(
+                            onClick = {
+                                if (userDisconnected) {
+                                    onClearAddress()
+                                    probeResult = null
+                                    probeError = null
+                                } else {
+                                    onDisconnect()
+                                    // Nothing of the old connection
+                                    // lingers into the next one.
+                                    probeResult = null
+                                    probeError = null
+                                }
+                            },
+                            enabled = connected,
+                        ) {
+                            Text(if (userDisconnected) "Clear" else "Disconnect")
+                        }
+                    }
                 }
             }
-        } else {
-            Button(
-                onClick = { cameraActive = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Open camera to scan address (QR code)")
-            }
-            Spacer(Modifier.height(8.dp))
+        }
+
+        Spacer(Modifier.height(16.dp))
+
+        // Scanning is a static button; the preview opens in a
+        // full-screen overlay and never reflows this tab.
+        Button(
+            onClick = {
+                if (hasCameraPermission) cameraActive = true
+                else permissionLauncher.launch(Manifest.permission.CAMERA)
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text(if (hasCameraPermission) "Open camera to scan address (QR code)" else "Grant camera permission to scan")
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "Tip: run 'qrencode -t ANSIUTF8 tc...' on the remote device to display its QR code in the terminal.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+
+        Spacer(Modifier.height(16.dp))
+
+        // Manual paste is the least common path: collapsed behind a
+        // toggle. When expanded, the hide control sits below the input.
+        // Plain clickable text, not TextButton: buttons' 48dp touch
+        // target adds a lot of padding around one small line.
+        if (!showManualInput) {
             Text(
-                "Tip: run 'qrencode -t ANSIUTF8 tc...' on the remote device to display its QR code in the terminal.",
-                style = MaterialTheme.typography.bodySmall,
+                "Or paste an address manually",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.clickable { showManualInput = true },
+            )
+        }
+        if (showManualInput) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                OutlinedTextField(
+                    value = manualAddress,
+                    onValueChange = { manualAddress = it },
+                    // Placeholder, not label: a floating label offsets
+                    // the input text downward, out of line with the
+                    // button's centered text.
+                    placeholder = { Text("tc...") },
+                    modifier = Modifier.weight(1f),
+                    singleLine = true,
+                )
+                Spacer(Modifier.width(8.dp))
+                // Same height as the text field: a default-height
+                // button centers against the field's 56dp box and
+                // reads as floating next to the input line.
+                Button(
+                    onClick = {
+                        if (manualAddress.startsWith("tc") && manualAddress.length > 2) {
+                            onAddressScanned(manualAddress)
+                            onUseAddress()
+                        }
+                    },
+                    modifier = Modifier.height(56.dp),
+                    enabled = manualAddress.startsWith("tc") && manualAddress.length > 2,
+                ) {
+                    Text("Use")
+                }
+            }
+            Text(
+                "Hide manual address input",
+                style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.clickable { showManualInput = false },
             )
         }
 
         Spacer(Modifier.height(16.dp))
 
-        // Saved addresses section
-        if (savedAddresses.addresses.isNotEmpty()) {
-            Text("Saved addresses", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            LazyColumn(
-                modifier = Modifier.weight(1f, fill = false),
-            ) {
-                items(savedAddresses.addresses) { saved ->
+        // Saved addresses: the only scrollable element, taking the
+        // remaining height. Tapping a card opens the rename dialog,
+        // which also carries the Remove action.
+        Text("Saved addresses", style = MaterialTheme.typography.titleMedium)
+        Spacer(Modifier.height(8.dp))
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            if (savedAddresses.addresses.isEmpty()) {
+                item {
+                    Text(
+                        "No saved addresses yet — connect to one above and tap Save to keep it here.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                items(savedAddresses.addresses, key = { it.address }) { saved ->
                     Card(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -190,136 +515,91 @@ fun ScanScreen(
                             }
                             TextButton(
                                 onClick = { onAddressScanned(saved.address) },
-                                enabled = saved.address != scannedAddress,
+                                enabled = scannedKey == null || addressKey(saved.address) != scannedKey,
                             ) {
                                 Text("Connect")
                             }
-                            TextButton(onClick = {
-                                removeTarget = saved.address
-                            }) {
-                                Text("Remove")
-                            }
                         }
                     }
                 }
             }
-            Spacer(Modifier.height(16.dp))
         }
+    }
 
-        if (scannedAddress.isNotEmpty()) {
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Address:", style = MaterialTheme.typography.labelMedium)
+    // Full-screen camera overlay: the tab keeps its layout while the
+    // scanner runs on top of it. Auto-closes on a valid address.
+    if (cameraActive) {
+        Dialog(
+            onDismissRequest = { cameraActive = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black)
+            ) {
+                TokenScanner(
+                    modifier = Modifier.fillMaxSize(),
+                    onToken = { token ->
+                        // Only accept tokens that look like tailcat addresses
+                        if (token.startsWith("tc") && token.length > 10 && token != scannedAddress) {
+                            cameraActive = false
+                            onAddressScanned(token)
+                        }
+                    },
+                )
+                // Close sits in the top corner, kept clear of the
+                // system bars: at the bottom it ended up under the
+                // navigation/action buttons on some devices.
+                IconButton(
+                    onClick = { cameraActive = false },
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .systemBarsPadding()
+                        .padding(16.dp)
+                        .background(Color.Black.copy(alpha = 0.5f), CircleShape),
+                ) {
+                    Icon(
+                        Icons.Default.Close,
+                        contentDescription = "Close camera",
+                        tint = Color.White,
+                    )
+                }
+            }
+        }
+    }
+
+    // Tapping the address opens this: the full address, selectable for
+    // copying, plus a copy-to-clipboard action.
+    if (showAddressDialog && connected) {
+        AlertDialog(
+            onDismissRequest = { showAddressDialog = false },
+            title = { Text("Address", style = MaterialTheme.typography.titleMedium) },
+            text = {
+                SelectionContainer {
                     Text(
                         scannedAddress,
-                        style = MaterialTheme.typography.bodyLarge,
-                        maxLines = 2,
+                        style = MaterialTheme.typography.bodyMedium,
+                        softWrap = true,
                     )
-                    Spacer(Modifier.height(8.dp))
-
-                    if (probing) {
-                        Spacer(Modifier.height(4.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            Spacer(Modifier.width(8.dp))
-                            Text(probeStatus, style = MaterialTheme.typography.bodySmall)
-                        }
-                    }
-
-                    probeResult?.let { r ->
-                        Spacer(Modifier.height(8.dp))
-                        val connColor = if (r.direct) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.tertiary
-                        Text(
-                            if (r.direct) "Direct connection (P2P)" else "Relayed via ${r.via}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = connColor,
-                        )
-                        Text(
-                            "Latency: ${r.latencyMs} ms",
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                        Spacer(Modifier.height(4.dp))
-                        val permParts = mutableListOf<String>()
-                        if (r.canRead) permParts.add("Read")
-                        if (r.canWrite) permParts.add("Write")
-                        if (permParts.isEmpty()) permParts.add("No access")
-                        Text(
-                            "Permissions: ${permParts.joinToString(" + ")}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = if (permParts.isNotEmpty() && permParts[0] != "No access")
-                                MaterialTheme.colorScheme.primary
-                            else MaterialTheme.colorScheme.error,
-                        )
-                    }
-
-                    probeError?.let {
-                        Spacer(Modifier.height(4.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Text(
-                                "Probe error: $it",
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                            Spacer(Modifier.width(8.dp))
-                            TextButton(
-                                onClick = { probeAttempt++ },
-                                enabled = !probing,
-                            ) {
-                                Text("Retry")
-                            }
-                        }
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-                    Row(modifier = Modifier.fillMaxWidth()) {
-                        if (!savedAddresses.contains(scannedAddress)) {
-                            OutlinedButton(onClick = {
-                                aliasInput = ""
-                                showSaveDialog = true
-                            }) {
-                                Text("Save")
-                            }
-                            Spacer(Modifier.width(8.dp))
-                        }
-                        OutlinedButton(onClick = {
-                            onClearAddress()
-                            probeResult = null
-                            probeError = null
-                        }) {
-                            Text("Disconnect")
-                        }
-                    }
                 }
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
-
-        Text("Or paste an address manually:", style = MaterialTheme.typography.labelMedium)
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            OutlinedTextField(
-                value = manualAddress,
-                onValueChange = { manualAddress = it },
-                label = { Text("tc...") },
-                modifier = Modifier.weight(1f),
-                singleLine = true,
-            )
-            Spacer(Modifier.width(8.dp))
-            Button(
-                onClick = {
-                    if (manualAddress.startsWith("tc") && manualAddress.length > 2) {
-                        onAddressScanned(manualAddress)
-                        onUseAddress()
-                    }
-                },
-                enabled = manualAddress.startsWith("tc") && manualAddress.length > 2,
-            ) {
-                Text("Use")
-            }
-        }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clipboard.setPrimaryClip(ClipData.newPlainText("tailcat address", scannedAddress))
+                    Toast.makeText(context, "Address copied", Toast.LENGTH_SHORT).show()
+                    showAddressDialog = false
+                }) {
+                    Text("Copy")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showAddressDialog = false }) {
+                    Text("Close")
+                }
+            },
+        )
     }
 
     // Save dialog
@@ -364,6 +644,16 @@ fun ScanScreen(
             text = {
                 Column {
                     Text("Change the alias for this address:", style = MaterialTheme.typography.bodySmall)
+                    // The card shows a truncated address; the dialog
+                    // shows the full one, selectable for copying.
+                    Spacer(Modifier.height(4.dp))
+                    SelectionContainer {
+                        Text(
+                            renameTarget!!,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     Spacer(Modifier.height(8.dp))
                     OutlinedTextField(
                         value = renameInput,
@@ -383,15 +673,25 @@ fun ScanScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showRenameDialog = false }) {
-                    Text("Cancel")
+                // Remove lives here, not on the card: it hands off to
+                // the confirmation dialog.
+                Row {
+                    TextButton(onClick = {
+                        removeTarget = renameTarget
+                        showRenameDialog = false
+                    }) {
+                        Text("Remove", color = MaterialTheme.colorScheme.error)
+                    }
+                    TextButton(onClick = { showRenameDialog = false }) {
+                        Text("Cancel")
+                    }
                 }
             },
         )
     }
 
     // Remove confirmation: deleting a saved address also drops it from
-    // the receive tab's "only saved devices" allowlist after the next
+    // the receive tab's "only saved addresses" allowlist after the next
     // restart, so it must be deliberate.
     if (removeTarget != null) {
         val alias = savedAddresses.addresses.firstOrNull { it.address == removeTarget }?.alias
@@ -402,7 +702,7 @@ fun ScanScreen(
                 Text(
                     "Remove ${alias ?: "this device"} from the saved list? " +
                         "Nothing on the device is affected, but it will no longer be allowed to " +
-                        "connect when 'Only saved devices may connect' is on.",
+                        "connect when 'Only saved addresses may connect' is on.",
                 )
             },
             confirmButton = {

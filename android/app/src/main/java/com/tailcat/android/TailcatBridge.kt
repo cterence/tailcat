@@ -301,6 +301,17 @@ fun addressKey(addr: String): String? = try {
 }
 
 /**
+ * Returns the tailcat address for an identity key JSON (as produced
+ * by TailcatKey.loadOrCreate) without starting a server, or null on
+ * failure. The Receive tab shows it before the first start.
+ */
+fun keyAddress(keyJSON: String): String? = try {
+    Bridge.keyAddress(keyJSON)
+} catch (e: Exception) {
+    null
+}
+
+/**
  * Helper: stream an InputStream to the tunnel in 64 KB chunks, then
  * half-close and read until EOF for delivery confirmation. Returns
  * the total bytes sent.

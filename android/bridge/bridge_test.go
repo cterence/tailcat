@@ -639,12 +639,11 @@ func TestProgressWriter(t *testing.T) {
 	}
 }
 
-// TestSFTPUploadPartNaming exercises the client SFTP path over the
-// tunnel: an upload lands under a .part name and is renamed into
-// place on completion, progress reaches the file's total, a name
-// collision takes a numbered variant, and a cancelled upload leaves
-// nothing behind.
-func TestSFTPUploadPartNaming(t *testing.T) {
+// TestSFTPUploadNaming exercises the client SFTP path over the
+// tunnel: an upload lands at its final name, progress reaches the
+// file's total, a name collision takes a numbered variant, and a
+// cancelled upload leaves nothing behind.
+func TestSFTPUploadNaming(t *testing.T) {
 	t.Parallel()
 
 	dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
@@ -716,7 +715,7 @@ func TestSFTPUploadPartNaming(t *testing.T) {
 		t.Errorf("final file content mismatch: %d bytes", len(got))
 	}
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
-		t.Errorf("server dir has %d entries after upload; want 1 (no .part left)", len(entries))
+		t.Errorf("server dir has %d entries after upload; want 1", len(entries))
 	}
 	mu.Lock()
 	if lastSent != int64(len(data)) || lastTotal != int64(len(data)) {
@@ -739,9 +738,6 @@ func TestSFTPUploadPartNaming(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "cancel.txt")); err == nil {
 		t.Error("cancelled upload left a final-named file")
-	}
-	if _, err := os.Stat(filepath.Join(dir, "cancel.txt.part")); err == nil {
-		t.Error("cancelled upload left a .part file")
 	}
 
 	// A cancelled download leaves no partial local file, and the
@@ -776,6 +772,105 @@ func TestSFTPUploadPartNaming(t *testing.T) {
 	wg.Wait()
 	if err1 != nil || err2 != nil {
 		t.Errorf("parallel downloads: %v, %v", err1, err2)
+	}
+}
+
+// TestCheckPermissions exercises the permission probe against every
+// serve mode over the tunnel. The probe creates and modifies nothing
+// on the remote: a drop box is recognized by its denied listing
+// (reported writable — it accepts uploads by definition), and
+// readable serves are decided by chmodding an existing file to the
+// mode it already has (read-write executes the no-op, read-only
+// denies it). Where nothing decides the answer the probe grants
+// write, and a failed upload surfaces the real answer in the UI.
+// The served directory must be unchanged after probing in every
+// mode — the original bug left a probe file behind on drop boxes,
+// whose Remove is always denied.
+func TestCheckPermissions(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name     string
+		mode     tailcat.FileServeMode
+		canRead  bool
+		canWrite bool
+	}{
+		{"rw", tailcat.FileServeRW, true, true},
+		{"ro", tailcat.FileServeRO, true, false},
+		{"wo", tailcat.FileServeWO, false, true},
+		{"wo+", tailcat.FileServeWOPlus, false, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			dm := integration.RunDERPAndSTUN(t, mkLogger(t, "derpstun"), "127.0.0.1")
+			reg := dm.Regions[1]
+			if reg == nil {
+				t.Fatal("no region 1 in derpmap")
+			}
+
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, "existing.txt"), []byte("content"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			// A write-locked file: chmod 0444 must not make a
+			// read-write serve look read-only (the server owns its
+			// files, so the no-op chmod succeeds regardless).
+			if err := os.WriteFile(filepath.Join(dir, "locked.txt"), []byte("locked"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(filepath.Join(dir, "locked.txt"), 0444); err != nil {
+				t.Fatal(err)
+			}
+
+			s := &Server{conns: make(map[*Conn]struct{}), stopWatch: make(chan struct{})}
+			wire := func(srv *tailcat.Server) {
+				handler := srv.SSHConnHandler(tailcat.SSHOptions{
+					Files: &tailcat.FileService{Dir: dir, Mode: tt.mode},
+				})
+				srv.OnTCP = func(port uint16) (h func(net.Conn)) {
+					if port == 22 {
+						return handler
+					}
+					return func(c net.Conn) { c.Close() }
+				}
+				srv.ServedTCPPorts = []filter.PortRange{{First: 22, Last: 22}}
+			}
+			pk := tailcat.NewPrivateKey()
+			if err := s.startServer(pk, reg, wire); err != nil {
+				t.Fatalf("startServer: %v", err)
+			}
+			t.Cleanup(s.Close)
+
+			c := NewClient(s.Addr(), "")
+			t.Cleanup(func() { c.Close() })
+			waitForDERP(t, s.srv, c.cl)
+			if err := c.Ping(); err != nil {
+				t.Fatalf("Ping: %v", err)
+			}
+
+			res, err := c.CheckPermissions()
+			if err != nil {
+				t.Fatalf("CheckPermissions: %v", err)
+			}
+			if res.CanRead != tt.canRead {
+				t.Errorf("CanRead = %v, want %v", res.CanRead, tt.canRead)
+			}
+			if res.CanWrite != tt.canWrite {
+				t.Errorf("CanWrite = %v, want %v", res.CanWrite, tt.canWrite)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 2 {
+				names := make([]string, len(entries))
+				for i, e := range entries {
+					names[i] = e.Name()
+				}
+				t.Errorf("served dir changed by probe: %v", names)
+			}
+		})
 	}
 }
 
