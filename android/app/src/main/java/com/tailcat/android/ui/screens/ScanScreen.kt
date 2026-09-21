@@ -268,19 +268,16 @@ fun ScanScreen(
                         },
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f),
                     )
                     // The card's one spinner, covering both a first
-                    // connection and a reconnect: fixed trailing
-                    // slot, present but empty when idle, so nothing
-                    // in the card ever shifts.
-                    Box(modifier = Modifier.size(16.dp)) {
-                        if (probing) {
-                            CircularProgressIndicator(
-                                modifier = Modifier.size(16.dp),
-                                strokeWidth = 2.dp,
-                            )
-                        }
+                    // connection and a reconnect, right next to the
+                    // "checking…" text — the text itself never moves.
+                    if (probing) {
+                        Spacer(Modifier.width(8.dp))
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            strokeWidth = 2.dp,
+                        )
                     }
                 }
                 val latencyText = when {
