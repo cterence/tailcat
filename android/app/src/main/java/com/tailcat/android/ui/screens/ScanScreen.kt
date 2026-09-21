@@ -129,9 +129,12 @@ fun ScanScreen(
     var probeAttempt by remember { mutableStateOf(0) }
     // True between a Reconnect tap and the end of the probe it
     // triggers: the button stays greyed with its spinner for exactly
-    // that window. A first-connection probe never sets it — its
-    // spinner lives in the connection row.
+    // that window. A first-connection probe never sets it — that
+    // spinner lives on the saved-address Connect button.
     var reconnecting by remember { mutableStateOf(false) }
+    // The saved address being connected to right now: its Connect
+    // button shows the spinner until the probe lands.
+    var connectingAddress by remember { mutableStateOf<String?>(null) }
 
     // Auto-probe when a new address is scanned — but skip if already cached
     LaunchedEffect(scannedAddress, probeAttempt) {
@@ -139,6 +142,7 @@ fun ScanScreen(
             probeResult = null
             probeError = null
             probing = false
+            connectingAddress = null
             return@LaunchedEffect
         }
         val cached = permCache.get(scannedAddress)
@@ -147,6 +151,7 @@ fun ScanScreen(
             probing = false
             probeError = null
             reconnecting = false
+            connectingAddress = null
             return@LaunchedEffect
         }
         probing = true
@@ -164,6 +169,7 @@ fun ScanScreen(
         }
         probing = false
         reconnecting = false
+        connectingAddress = null
     }
 
     // The watchdog's periodic recheck updated the cache (the remote
@@ -256,34 +262,19 @@ fun ScanScreen(
                         if (probeResult!!.direct) "direct (P2P)" else "relayed via ${probeResult!!.via}"
                     else -> "–"
                 }
-                if (probing) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            strokeWidth = 2.dp,
-                        )
-                        Spacer(Modifier.width(8.dp))
-                        Text(
-                            "Connection: checking…",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                } else {
-                    Text(
-                        "Connection: $connText",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = when {
-                            connectionLost || probeError != null -> MaterialTheme.colorScheme.error
-                            userDisconnected -> MaterialTheme.colorScheme.onSurfaceVariant
-                            livePing?.direct == true || probeResult?.direct == true -> MaterialTheme.colorScheme.primary
-                            livePing != null || probeResult != null -> MaterialTheme.colorScheme.tertiary
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
+                Text(
+                    "Connection: $connText",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = when {
+                        connectionLost || probeError != null -> MaterialTheme.colorScheme.error
+                        userDisconnected -> MaterialTheme.colorScheme.onSurfaceVariant
+                        livePing?.direct == true || probeResult?.direct == true -> MaterialTheme.colorScheme.primary
+                        livePing != null || probeResult != null -> MaterialTheme.colorScheme.tertiary
+                        else -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
                 val latencyText = when {
                     connectionLost || userDisconnected || probing || probeError != null -> "–"
                     livePing != null -> "${livePing!!.latencyMs} ms"
@@ -514,9 +505,20 @@ fun ScanScreen(
                                 )
                             }
                             TextButton(
-                                onClick = { onAddressScanned(saved.address) },
-                                enabled = scannedKey == null || addressKey(saved.address) != scannedKey,
+                                onClick = {
+                                    connectingAddress = saved.address
+                                    onAddressScanned(saved.address)
+                                },
+                                enabled = connectingAddress != saved.address &&
+                                    (scannedKey == null || addressKey(saved.address) != scannedKey),
                             ) {
+                                if (connectingAddress == saved.address) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                }
                                 Text("Connect")
                             }
                         }
