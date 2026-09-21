@@ -128,13 +128,8 @@ fun ScanScreen(
     // Incremented by the Retry control to re-run the probe.
     var probeAttempt by remember { mutableStateOf(0) }
     // True between a Reconnect tap and the end of the probe it
-    // triggers: the button stays greyed with its spinner for exactly
-    // that window. A first-connection probe never sets it — that
-    // spinner lives on the saved-address Connect button.
+    // triggers: the swap slot stays greyed for exactly that window.
     var reconnecting by remember { mutableStateOf(false) }
-    // The saved address being connected to right now: its Connect
-    // button shows the spinner until the probe lands.
-    var connectingAddress by remember { mutableStateOf<String?>(null) }
 
     // Auto-probe when a new address is scanned — but skip if already cached
     LaunchedEffect(scannedAddress, probeAttempt) {
@@ -143,7 +138,6 @@ fun ScanScreen(
             probeError = null
             probing = false
             reconnecting = false
-            connectingAddress = null
             return@LaunchedEffect
         }
         val cached = permCache.get(scannedAddress)
@@ -152,7 +146,6 @@ fun ScanScreen(
             probing = false
             probeError = null
             reconnecting = false
-            connectingAddress = null
             return@LaunchedEffect
         }
         probing = true
@@ -170,7 +163,6 @@ fun ScanScreen(
         }
         probing = false
         reconnecting = false
-        connectingAddress = null
     }
 
     // The watchdog's periodic recheck updated the cache (the remote
@@ -263,19 +255,34 @@ fun ScanScreen(
                         if (probeResult!!.direct) "direct (P2P)" else "relayed via ${probeResult!!.via}"
                     else -> "–"
                 }
-                Text(
-                    "Connection: $connText",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = when {
-                        connectionLost || probeError != null -> MaterialTheme.colorScheme.error
-                        userDisconnected -> MaterialTheme.colorScheme.onSurfaceVariant
-                        livePing?.direct == true || probeResult?.direct == true -> MaterialTheme.colorScheme.primary
-                        livePing != null || probeResult != null -> MaterialTheme.colorScheme.tertiary
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    },
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Connection: $connText",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = when {
+                            connectionLost || probeError != null -> MaterialTheme.colorScheme.error
+                            userDisconnected -> MaterialTheme.colorScheme.onSurfaceVariant
+                            livePing?.direct == true || probeResult?.direct == true -> MaterialTheme.colorScheme.primary
+                            livePing != null || probeResult != null -> MaterialTheme.colorScheme.tertiary
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    // The card's one spinner, covering both a first
+                    // connection and a reconnect: fixed trailing
+                    // slot, present but empty when idle, so nothing
+                    // in the card ever shifts.
+                    Box(modifier = Modifier.size(16.dp)) {
+                        if (probing) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp,
+                            )
+                        }
+                    }
+                }
                 val latencyText = when {
                     connectionLost || userDisconnected || probing || probeError != null -> "–"
                     livePing != null -> "${livePing!!.latencyMs} ms"
@@ -379,18 +386,6 @@ fun ScanScreen(
                             enabled = connected && !probing && !reconnecting,
                         ) {
                             Text(if (connectionDown) "Reconnect" else "Disconnect")
-                            // The spinner lives in a fixed trailing
-                            // slot, present but empty when idle, so
-                            // the button's width never changes and
-                            // Clear on its left never shifts.
-                            Box(modifier = Modifier.size(16.dp)) {
-                                if (reconnecting) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp,
-                                    )
-                                }
-                            }
                         }
                     }
                 }
@@ -517,24 +512,10 @@ fun ScanScreen(
                                 )
                             }
                             TextButton(
-                                onClick = {
-                                    connectingAddress = saved.address
-                                    onAddressScanned(saved.address)
-                                },
-                                enabled = connectingAddress != saved.address &&
-                                    (scannedKey == null || addressKey(saved.address) != scannedKey),
+                                onClick = { onAddressScanned(saved.address) },
+                                enabled = scannedKey == null || addressKey(saved.address) != scannedKey,
                             ) {
                                 Text("Connect")
-                                // Same fixed trailing slot: the card's
-                                // layout never shifts while connecting.
-                                Box(modifier = Modifier.size(16.dp)) {
-                                    if (connectingAddress == saved.address) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(16.dp),
-                                            strokeWidth = 2.dp,
-                                        )
-                                    }
-                                }
                             }
                         }
                     }
