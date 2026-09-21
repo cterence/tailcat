@@ -378,14 +378,19 @@ fun ScanScreen(
                             // the swap target, not a live control.
                             enabled = connected && !probing && !reconnecting,
                         ) {
-                            if (reconnecting) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(16.dp),
-                                    strokeWidth = 2.dp,
-                                )
-                                Spacer(Modifier.width(8.dp))
-                            }
                             Text(if (connectionDown) "Reconnect" else "Disconnect")
+                            // The spinner lives in a fixed trailing
+                            // slot, present but empty when idle, so
+                            // the button's width never changes and
+                            // Clear on its left never shifts.
+                            Box(modifier = Modifier.size(16.dp)) {
+                                if (reconnecting) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(16.dp),
+                                        strokeWidth = 2.dp,
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -519,14 +524,17 @@ fun ScanScreen(
                                 enabled = connectingAddress != saved.address &&
                                     (scannedKey == null || addressKey(saved.address) != scannedKey),
                             ) {
-                                if (connectingAddress == saved.address) {
-                                    CircularProgressIndicator(
-                                        modifier = Modifier.size(16.dp),
-                                        strokeWidth = 2.dp,
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                }
                                 Text("Connect")
+                                // Same fixed trailing slot: the card's
+                                // layout never shifts while connecting.
+                                Box(modifier = Modifier.size(16.dp)) {
+                                    if (connectingAddress == saved.address) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(16.dp),
+                                            strokeWidth = 2.dp,
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
