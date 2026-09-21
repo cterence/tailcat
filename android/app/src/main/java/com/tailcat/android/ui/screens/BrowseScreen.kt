@@ -189,6 +189,11 @@ fun BrowseScreen(
                 state.connectedAddress = address
                 state.files = state.sftp!!.listDir(state.path)
             }
+        } catch (e: CancellationException) {
+            // Tabbing away cancels this effect mid-connect (Compose:
+            // "the coroutine scope left the composition") — not a
+            // connection failure, never displayed as one.
+            throw e
         } catch (e: Exception) {
             state.error = e.message
         }
@@ -210,6 +215,10 @@ fun BrowseScreen(
                     }
                     block(state.sftp!!)
                 }
+            } catch (e: CancellationException) {
+                // App-exit cancellation: nothing to clean up toward
+                // the user, and never an error to display.
+                throw e
             } catch (e: Exception) {
                 state.error = e.message
                 withContext(Dispatchers.IO) {
