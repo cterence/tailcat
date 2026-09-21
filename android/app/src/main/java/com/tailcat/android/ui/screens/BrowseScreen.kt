@@ -151,7 +151,11 @@ fun BrowseScreen(
     // in with the same address is a no-op — no re-probe, no reload.
     // A session lost to an error (closed by withSftp) reconnects and
     // relists the current directory on the next tab entry.
-    LaunchedEffect(address, canRead) {
+    // Keyed on session presence too: a session that died mid-use
+    // (server restart, network drop) is closed by withSftp, and this
+    // effect then re-runs and reconnects on its own — the tab heals
+    // instead of spinning forever on a dead session.
+    LaunchedEffect(address, canRead, state.sftp == null) {
         if (address.isEmpty()) {
             withContext(Dispatchers.IO) { state.closeConnection() }
             state.resetListing()
@@ -222,8 +226,10 @@ fun BrowseScreen(
     // Derived loading: also true while an address is set but the
     // session has not been established yet (first entry, or between
     // the first frame and the connect effect), so the empty-directory
-    // message never flashes for a frame.
-    val loading = state.loading || (address.isNotEmpty() && state.sftp == null)
+    // message never flashes for a frame. A failed connect must not
+    // spin forever: the error line replaces the spinner.
+    val loading = state.loading ||
+        (address.isNotEmpty() && state.sftp == null && state.error == null)
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
         if (address.isEmpty()) {
